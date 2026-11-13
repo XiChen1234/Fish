@@ -137,11 +137,21 @@
 const $ = id => document.getElementById(id);
 const state = {
   ws: null, token: '', deviceID: '', role: '', peer: '', peerOnline: false,
+  addr: '', // 当前消息区所属的服务器地址，切换时需整体重置
   // 本地已收到游标：只存内存。刷新后 DOM 清空 → 游标归零 → 重连走全量拉取。
   localSeq: 0,
   syncing: false,
   pending: new Map() // 乐观气泡 ref -> bubble 元素
 };
+
+// 切换服务器 / 身份时调用：DOM 里的气泡和游标都只属于上一个会话，
+// 必须一起清掉，否则 sync(after=旧游标) 会漏掉历史、还会串出上一身份的消息。
+function resetMessages() {
+  $('msgs').innerHTML = '';
+  state.localSeq = 0;
+  state.syncing = false;
+  state.pending.clear();
+}
 
 // ---- 本地记忆 ----
 function saveCfg() {
@@ -254,6 +264,11 @@ function connect(action) {
   }
 
   showErr('');
+  // 换了服务器地址：旧气泡与旧游标都属于上一台服务器，先整体重置
+  const base = apiBase();
+  if (state.addr && state.addr !== base) resetMessages();
+  state.addr = base;
+
   state.ws && state.ws.close();
   state.ws = null;
   state.syncing = false;
@@ -328,6 +343,8 @@ function handleFrame(f) {
         clearSavedAuth();
         return;
       }
+      // 切换了身份：旧身份的消息气泡与游标作废，避免漏拉新身份的历史
+      if (state.role && state.role !== d.role) resetMessages();
       state.role = d.role;
       state.peer = state.role === 'A' ? 'B' : 'A';
       state.token = d.token;
