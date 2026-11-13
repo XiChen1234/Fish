@@ -151,7 +151,7 @@ func (s *Server) authFile(w http.ResponseWriter, r *http.Request) (string, bool)
 	if tok == "" {
 		tok = r.URL.Query().Get("token")
 	}
-	role, _, ok := s.auth.Verify(tok)
+	role, _, ok := s.auth.VerifyActive(tok)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid token"})
 		return "", false

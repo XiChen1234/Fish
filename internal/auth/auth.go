@@ -172,6 +172,20 @@ func (a *Auth) Resume(deviceID, token string) (role, devID, tok string, err erro
 	return r, did, token, nil
 }
 
+// VerifyActive 校验 token 有效且仍是该设备当前 token。
+// 与 Resume 的吊销语义一致：同一设备重新登录换发 token 后，旧 token 立刻不可用。
+func (a *Auth) VerifyActive(token string) (role, deviceID string, ok bool) {
+	r, did, ok := a.Verify(token)
+	if !ok {
+		return "", "", false
+	}
+	dev, err := a.store.GetDevice(did)
+	if err != nil || dev == nil || dev.Role != r || dev.Token != token {
+		return "", "", false
+	}
+	return r, did, true
+}
+
 // Verify 验证 JWT，返回 (role, deviceID, ok)。
 // token 无效/过期返回 ("","",false)。
 func (a *Auth) Verify(token string) (role, deviceID string, ok bool) {
