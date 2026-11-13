@@ -48,14 +48,11 @@ func newTestServer(t *testing.T) (*httptest.Server, *store.Store, *hub.Hub) {
 func TestInitAndLogin(t *testing.T) {
 	ts, _, _ := newTestServer(t)
 
-	var gotReadyA, gotReadyB bool
+	// 回调在独立分发协程执行，Connect 返回不保证 ready 已处理完毕
+	readyCh := make(chan string, 4)
 	cb := func(ev client.Event) {
 		if ev.Type == client.EventReady {
-			if ev.Ready.Role == "A" {
-				gotReadyA = true
-			} else if ev.Ready.Role == "B" {
-				gotReadyB = true
-			}
+			readyCh <- ev.Ready.Role
 		}
 	}
 
@@ -70,6 +67,20 @@ func TestInitAndLogin(t *testing.T) {
 		t.Fatalf("B login: %v", err)
 	}
 	defer b.Close()
+
+	var gotReadyA, gotReadyB bool
+	for i := 0; i < 2; i++ {
+		select {
+		case role := <-readyCh:
+			if role == "A" {
+				gotReadyA = true
+			} else if role == "B" {
+				gotReadyB = true
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("ready 未触发 A=%v B=%v", gotReadyA, gotReadyB)
+		}
+	}
 
 	if !gotReadyA || !gotReadyB {
 		t.Fatalf("ready 未触发 A=%v B=%v", gotReadyA, gotReadyB)
@@ -448,6 +459,51 @@ func TestReconnectAfterClose(t *testing.T) {
 	}
 	if _, err := a.SendText("offline"); err == nil {
 		t.Fatal("Close 后 SendText 应报错")
+	}
+}
+
+// TestCallbackCanSend 验证回调内调用同步方法（SendText）不会超时。
+// 旧实现中 handleFrame 在 readLoop 里同步执行回调，回调内等待 ack 时
+// readLoop 被占用、无法读取回执，必然等满 ackTimeout 后误报超时。
+func TestCallbackCanSend(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+
+	sendErr := make(chan error, 1)
+	var a *client.Client
+	var once sync.Once
+	cb := func(ev client.Event) {
+		if ev.Type != client.EventMessage {
+			return
+		}
+		once.Do(func() {
+			_, err := a.SendText("echo-from-callback")
+			sendErr <- err
+		})
+	}
+
+	a = client.New(ts.URL, cb)
+	if err := a.Connect(client.ConnectOptions{DeviceID: "dev-a", Password: "secret1234", Action: client.ActionInit}); err != nil {
+		t.Fatalf("A init: %v", err)
+	}
+	defer a.Close()
+
+	b := client.New(ts.URL, nil)
+	if err := b.Connect(client.ConnectOptions{DeviceID: "dev-b", Password: "secret1234", Action: client.ActionLogin}); err != nil {
+		t.Fatalf("B login: %v", err)
+	}
+	defer b.Close()
+
+	if _, err := b.SendText("trigger-callback"); err != nil {
+		t.Fatalf("B SendText: %v", err)
+	}
+
+	select {
+	case err := <-sendErr:
+		if err != nil {
+			t.Fatalf("回调内 SendText 失败: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("回调内 SendText 超时（事件分发仍阻塞在 readLoop 中）")
 	}
 }
 

@@ -7,7 +7,9 @@
 //   - readLoop 单协程读 WS，handleFrame 串行处理入站帧；
 //   - SendText / SendImage / Sync / 自动 ack / pong 回复 / 心跳 ping 全部走 sendCh；
 //   - pendingAck / pendingSync 是 Client 私有字段（带各自的 mutex），
-//     多 Client 实例之间完全隔离，互不干扰。
+//     多 Client 实例之间完全隔离，互不干扰；
+//   - 上行事件（cb）由独立的 dispatch 协程串行回调，readLoop 只负责投递，
+//     因此回调内可以安全调用 SendText / Sync（否则会等 ack 超时）。
 package client
 
 import (
@@ -96,11 +98,12 @@ type ackResult struct {
 }
 
 const (
-	sendBufferCap = 64              // sendCh 容量
-	pingInterval  = 25 * time.Second // 心跳，略短于服务端 90s 超时的 1/3
-	writeWait     = 10 * time.Second // WriteJSON 单次超时
-	ackTimeout    = 15 * time.Second // msg.send 等待 ack 超时
-	syncTimeout   = 30 * time.Second // sync 等待超时
+	sendBufferCap  = 64               // sendCh 容量
+	eventBufferCap = 256              // 事件分发队列容量
+	pingInterval   = 25 * time.Second // 心跳，略短于服务端 90s 超时的 1/3
+	writeWait      = 10 * time.Second // WriteJSON 单次超时
+	ackTimeout     = 15 * time.Second // msg.send 等待 ack 超时
+	syncTimeout    = 30 * time.Second // sync 等待超时
 )
 
 // conn 一条连接的运行时状态。重连时整体替换，旧协程只持有旧实例，
@@ -123,28 +126,35 @@ type Client struct {
 	cur *conn
 
 	// 身份 & 状态
-	deviceID string
-	token    string
-	role     string
-	lastSeq  int64
+	deviceID  string
+	token     string
+	role      string
+	lastSeq   int64
 	connected atomic.Bool
 
+	// 事件分发：readLoop 只投递到 events，由独立 dispatch 协程串行调用回调，
+	// 避免回调内调用 Send/Sync 时因 readLoop 被阻塞而必然超时。
+	events chan Event
+
 	// 等待器（Client 私有，多实例隔离）
-	muAck      sync.Mutex
-	pendingAck map[string]*ackWaiter
-	muSync     sync.Mutex
+	muAck       sync.Mutex
+	pendingAck  map[string]*ackWaiter
+	muSync      sync.Mutex
 	pendingSync map[string]chan *SyncResult
 }
 
 // New 构造一个未连接的 Client。server 不带末尾 /。
 func New(server string, cb func(Event)) *Client {
-	return &Client{
+	c := &Client{
 		server:      strings.TrimRight(server, "/"),
 		cb:          cb,
 		httpCli:     &http.Client{Timeout: 30 * time.Second},
+		events:      make(chan Event, eventBufferCap),
 		pendingAck:  make(map[string]*ackWaiter),
 		pendingSync: make(map[string]chan *SyncResult),
 	}
+	go c.dispatch()
+	return c
 }
 
 // ---------- Connect ----------
@@ -153,8 +163,8 @@ func New(server string, cb func(Event)) *Client {
 type ConnectAction string
 
 const (
-	ActionInit  ConnectAction = "init"
-	ActionLogin ConnectAction = "login"
+	ActionInit   ConnectAction = "init"
+	ActionLogin  ConnectAction = "login"
 	ActionResume ConnectAction = "resume"
 )
 
@@ -593,8 +603,11 @@ func (c *Client) currentConn() *conn {
 
 // ---------- ack / sync 等待机制（Client 私有） ----------
 
+// refCounter 保证同一纳秒内生成的多个 ref 不重复（包级自增，多 Client 共享）。
+var refCounter atomic.Uint64
+
 func (c *Client) genRef() string {
-	return "ref-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	return "ref-" + strconv.FormatInt(time.Now().UnixNano(), 10) + "-" + strconv.FormatUint(refCounter.Add(1), 10)
 }
 
 // sendAndWaitAck 发送 msg.send 并等待 msg.ack。
@@ -692,11 +705,32 @@ func (c *Client) LastSeq() int64  { return atomic.LoadInt64(&c.lastSeq) }
 
 // ---------- emit ----------
 
+// emit 非阻塞地把事件投入分发队列。readLoop 调用它时不会因回调耗时被阻塞，
+// 因此回调内可以安全调用 SendText / SendImage / Sync 等同步等待方法。
 func (c *Client) emit(e Event) {
-	if c.cb != nil {
-		defer func() { _ = recover() }()
-		c.cb(e)
+	if c.cb == nil {
+		return
 	}
+	select {
+	case c.events <- e:
+	default:
+		// 回调处理速度长期落后于入站帧：丢弃该事件避免阻塞读循环。
+		// 消息可由 Sync 补齐，其余事件为瞬时通知。
+		log.Printf("[client] 事件队列已满，丢弃事件 type=%s", e.Type)
+	}
+}
+
+// dispatch 串行调用上层回调，保证事件顺序与入站帧顺序一致。
+func (c *Client) dispatch() {
+	for e := range c.events {
+		c.emitSync(e)
+	}
+}
+
+// emitSync 同步执行回调，隔离上层 panic，避免拖垮分发协程。
+func (c *Client) emitSync(e Event) {
+	defer func() { _ = recover() }()
+	c.cb(e)
 }
 
 // ---------- helpers ----------
