@@ -394,6 +394,63 @@ func TestDeliveredAck(t *testing.T) {
 	}
 }
 
+// TestReconnectAfterClose 验证同一 Client 关闭后可再次连接。
+// 旧实现把 closeOnce 存在 Client 上且重连时不重置，第二次 Close 会变成空操作：
+// 新连接的 closeCh 永远不关闭、等待者无法被唤醒。
+func TestReconnectAfterClose(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+
+	closedCh := make(chan struct{}, 4)
+	cb := func(ev client.Event) {
+		if ev.Type == client.EventClosed {
+			closedCh <- struct{}{}
+		}
+	}
+
+	// 从未连接时 Close 不应 panic（旧实现对 nil channel 调用 close）
+	client.New(ts.URL, nil).Close()
+
+	a := client.New(ts.URL, cb)
+	if err := a.Connect(client.ConnectOptions{DeviceID: "dev-a", Password: "secret1234", Action: client.ActionInit}); err != nil {
+		t.Fatalf("首次连接: %v", err)
+	}
+	token := a.Token()
+	a.Close()
+	select {
+	case <-closedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("首次 Close 未触发 EventClosed")
+	}
+
+	// 同一实例重连
+	if err := a.Connect(client.ConnectOptions{Action: client.ActionResume, Token: token, DeviceID: "dev-a"}); err != nil {
+		t.Fatalf("重连: %v", err)
+	}
+	if a.Role() != "A" {
+		t.Fatalf("重连后 role 应仍为 A, got %q", a.Role())
+	}
+	seq, err := a.SendText("after-reconnect")
+	if err != nil {
+		t.Fatalf("重连后 SendText: %v", err)
+	}
+	if seq <= 0 {
+		t.Fatalf("重连后 seq 应 >0, got %d", seq)
+	}
+
+	a.Close()
+	select {
+	case <-closedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("重连后 Close 未触发 EventClosed")
+	}
+	if a.Connected() {
+		t.Fatal("Close 后 Connected 应为 false")
+	}
+	if _, err := a.SendText("offline"); err == nil {
+		t.Fatal("Close 后 SendText 应报错")
+	}
+}
+
 func itoa(i int) string {
 	if i == 0 {
 		return "0"

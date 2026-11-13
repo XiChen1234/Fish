@@ -103,18 +103,24 @@ const (
 	syncTimeout   = 30 * time.Second // sync 等待超时
 )
 
-// Client SDK 主结构。非线程安全：
-// Connect / Close 必须在其它方法调用之前 / 之后；
-// Send / Sync / Upload 之间可并发（内部通过 sendCh 串行化）。
+// conn 一条连接的运行时状态。重连时整体替换，旧协程只持有旧实例，
+// 因此不会读写到被新连接覆盖的字段（closeOnce 无法重置的老问题）。
+type conn struct {
+	ws      *websocket.Conn
+	sendCh  chan hub.Frame // write pump 输入
+	closeCh chan struct{}  // 本条连接的关闭信号
+	once    sync.Once      // 保证本条连接只收尾一次
+}
+
+// Client SDK 主结构。Connect / Close 自身不可并发调用；
+// Send / Sync / Upload 之间可并发（内部通过 conn.sendCh 串行化）。
 type Client struct {
 	server  string
 	httpCli *http.Client
 	cb      func(Event)
 
-	ws       *websocket.Conn
-	sendCh   chan hub.Frame // write pump 输入
-	closeCh  chan struct{}  // 全局关闭信号
-	closeOnce sync.Once
+	mu  sync.Mutex // 保护 cur 与身份字段（重连时整体替换）
+	cur *conn
 
 	// 身份 & 状态
 	deviceID string
@@ -161,24 +167,29 @@ type ConnectOptions struct {
 	Token       string        // resume 专用，优先级高于 Client.token
 }
 
-// Connect 建立 WS + auth 握手。成功后 readLoop / writePump / ping 协程全部拉起，
+// Connect 建立 WS + auth 握手。成功后 readLoop / writePump 协程拉起，
 // 返回后连接处于就绪状态（已过 auth 并 emit EventReady）。
+// 允许在已连接状态下再次调用：会先关闭旧连接，再建立新连接。
 func (c *Client) Connect(opts ConnectOptions) error {
 	if opts.Action == "" {
 		return errors.New("必须指定 action：init / login / resume")
 	}
+	// 重连前先收尾旧连接，保证同一 Client 只保留一条活跃连接
+	c.Close()
+
+	c.mu.Lock()
 	if opts.DeviceID != "" {
 		c.deviceID = opts.DeviceID
 	} else if c.deviceID == "" {
 		c.deviceID = RandDeviceID()
 	}
-	if opts.Action == ActionResume {
-		if opts.Token != "" {
-			c.token = opts.Token
-		}
-		if c.token == "" {
-			return errors.New("resume 需要 token")
-		}
+	if opts.Action == ActionResume && opts.Token != "" {
+		c.token = opts.Token
+	}
+	deviceID, token := c.deviceID, c.token
+	c.mu.Unlock()
+	if opts.Action == ActionResume && token == "" {
+		return errors.New("resume 需要 token")
 	}
 
 	wsURL := "ws" + strings.TrimPrefix(c.server, "http") + "/ws"
@@ -186,23 +197,23 @@ func (c *Client) Connect(opts ConnectOptions) error {
 	if err != nil {
 		return fmt.Errorf("WS dial: %w", err)
 	}
-	c.ws = ws
-	c.sendCh = make(chan hub.Frame, sendBufferCap)
-	c.closeCh = make(chan struct{})
-	c.connected.Store(true)
+	cn := &conn{
+		ws:      ws,
+		sendCh:  make(chan hub.Frame, sendBufferCap),
+		closeCh: make(chan struct{}),
+	}
 
 	// 发送 auth 帧
 	authData, _ := json.Marshal(map[string]any{
-		"device_id":    c.deviceID,
+		"device_id":    deviceID,
 		"action":       string(opts.Action),
 		"password":     opts.Password,
 		"desired_role": opts.DesiredRole,
-		"token":        c.token,
+		"token":        token,
 	})
 	_ = ws.SetWriteDeadline(time.Now().Add(writeWait))
 	if err := ws.WriteJSON(hub.Frame{V: 1, Type: "auth", TS: time.Now().UnixMilli(), Data: authData}); err != nil {
 		ws.Close()
-		c.connected.Store(false)
 		return fmt.Errorf("发送 auth: %w", err)
 	}
 	_ = ws.SetWriteDeadline(time.Time{})
@@ -211,44 +222,45 @@ func (c *Client) Connect(opts ConnectOptions) error {
 	var f hub.Frame
 	if err := ws.ReadJSON(&f); err != nil {
 		ws.Close()
-		c.connected.Store(false)
 		return fmt.Errorf("读 auth.result: %w", err)
 	}
 	_ = ws.SetReadDeadline(time.Time{})
 	if f.Type != "auth.result" {
 		ws.Close()
-		c.connected.Store(false)
 		return fmt.Errorf("首帧应为 auth.result, got %s", f.Type)
 	}
 	var res authResult
 	if err := json.Unmarshal(f.Data, &res); err != nil {
 		ws.Close()
-		c.connected.Store(false)
 		return fmt.Errorf("auth.result 解析: %w", err)
 	}
 	if !res.Success {
 		ws.Close()
-		c.connected.Store(false)
 		return errors.New(res.Error)
 	}
 
+	c.mu.Lock()
 	c.role = res.Role
 	if res.DeviceID != "" {
 		c.deviceID = res.DeviceID
 	}
 	c.token = res.Token
+	c.cur = cn
+	deviceID, token = c.deviceID, c.token
+	c.mu.Unlock()
+	c.connected.Store(true)
 
 	// 就绪后拉起协程
-	go c.writePump()
-	go c.readLoop()
+	go c.writePump(cn)
+	go c.readLoop(cn)
 
 	c.emit(Event{
 		Type: EventReady,
 		Ready: &ReadyInfo{
 			Role:       res.Role,
 			Peer:       peerOf(res.Role),
-			DeviceID:   c.deviceID,
-			Token:      res.Token,
+			DeviceID:   deviceID,
+			Token:      token,
 			PeerOnline: res.PeerOnline,
 			LastSeq:    res.LastSeq,
 		},
@@ -258,41 +270,63 @@ func (c *Client) Connect(opts ConnectOptions) error {
 
 // ---------- Close ----------
 
-// Close 关闭连接。可重入，多次调用只生效一次。
+// Close 关闭当前连接。可重入，多次调用只生效一次。
 func (c *Client) Close() {
-	c.closeOnce.Do(func() {
-		c.connected.Store(false)
-		close(c.closeCh)        // 通知 writePump / readLoop
-		if c.ws != nil {
-			_ = c.ws.Close()    // 强制断开，readLoop 会收到错误退出
+	c.mu.Lock()
+	cn := c.cur
+	c.mu.Unlock()
+	if cn != nil {
+		c.closeConn(cn)
+	}
+}
+
+// closeConn 对指定连接做一次性收尾。
+// 若该连接已被新连接取代（重连场景），只释放自身资源，
+// 不改动 Client 状态、也不对外抛 EventClosed。
+func (c *Client) closeConn(cn *conn) {
+	cn.once.Do(func() {
+		close(cn.closeCh) // 通知 writePump / readLoop 及等待者
+		_ = cn.ws.Close() // 强制断开，readLoop 会收到错误退出
+
+		c.mu.Lock()
+		isCurrent := c.cur == cn
+		if isCurrent {
+			c.cur = nil
+			c.connected.Store(false)
 		}
-		c.emit(Event{Type: EventClosed})
+		c.mu.Unlock()
+
+		if isCurrent {
+			c.emit(Event{Type: EventClosed})
+		}
 	})
 }
 
 // ---------- writePump ----------
 
-// writePump 串行化所有 WS 写入（业务帧 + 心跳），单协程 goroutine 安全。
-// 退出条件：closeCh 关闭 或 WS 写入失败。
-func (c *Client) writePump() {
+// writePump 串行化一条连接上的所有 WS 写入（业务帧 + 心跳）。
+// 退出条件：closeCh 关闭 或 WS 写入失败（写失败时主动收尾，唤醒等待者）。
+func (c *Client) writePump(cn *conn) {
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
 
 	for {
 		select {
-		case <-c.closeCh:
+		case <-cn.closeCh:
 			return
 
-		case frame, ok := <-c.sendCh:
+		case frame, ok := <-cn.sendCh:
 			if !ok {
 				return // sendCh 被 close（当前实现不会手动 close，防御性分支）
 			}
-			if c.writeFrame(frame) {
-				return // 写入失败，退出
+			if c.writeFrame(cn, frame) {
+				c.closeConn(cn)
+				return
 			}
 
 		case <-pingTicker.C:
-			if c.writeFrame(hub.Frame{V: 1, Type: "ping"}) {
+			if c.writeFrame(cn, hub.Frame{V: 1, Type: "ping"}) {
+				c.closeConn(cn)
 				return
 			}
 		}
@@ -300,13 +334,13 @@ func (c *Client) writePump() {
 }
 
 // writeFrame 单次 WriteJSON，返回 true 表示写入失败。
-func (c *Client) writeFrame(f hub.Frame) bool {
-	if c.ws == nil {
+func (c *Client) writeFrame(cn *conn, f hub.Frame) bool {
+	if cn.ws == nil {
 		return true
 	}
-	_ = c.ws.SetWriteDeadline(time.Now().Add(writeWait))
-	err := c.ws.WriteJSON(f)
-	_ = c.ws.SetWriteDeadline(time.Time{})
+	_ = cn.ws.SetWriteDeadline(time.Now().Add(writeWait))
+	err := cn.ws.WriteJSON(f)
+	_ = cn.ws.SetWriteDeadline(time.Time{})
 	if err != nil {
 		log.Printf("[client] 写入失败 type=%s: %v", f.Type, err)
 		return true
@@ -314,16 +348,15 @@ func (c *Client) writeFrame(f hub.Frame) bool {
 	return false
 }
 
-// sendFrame 投递到 sendCh。若 channel 已满或已关闭（closedOnce）则丢弃，
-// 返回 false 表示未投递成功。
-func (c *Client) sendFrame(f hub.Frame) bool {
-	if !c.connected.Load() {
+// sendFrameOn 把帧投递到指定连接的 sendCh。连接已关闭或队列满时返回 false。
+func (c *Client) sendFrameOn(cn *conn, f hub.Frame) bool {
+	if cn == nil {
 		return false
 	}
 	select {
-	case c.sendCh <- f:
+	case cn.sendCh <- f:
 		return true
-	case <-c.closeCh:
+	case <-cn.closeCh:
 		return false
 	default:
 		// 队列满（writePump 卡死），直接丢弃；readLoop / Close 会触发整体退出
@@ -334,31 +367,26 @@ func (c *Client) sendFrame(f hub.Frame) bool {
 
 // ---------- readLoop ----------
 
-func (c *Client) readLoop() {
-	defer func() {
-		// 网络异常 / 服务端主动断开时触发；若已 Close() 则 closeOnce.Do 无效
-		c.Close()
-	}()
+func (c *Client) readLoop(cn *conn) {
+	// 网络异常 / 服务端主动断开时触发；once 保证与 Close 竞争时只收尾一次
+	defer c.closeConn(cn)
 
 	for {
 		select {
-		case <-c.closeCh:
+		case <-cn.closeCh:
 			return
 		default:
 		}
-		if c.ws == nil {
-			return
-		}
 		var f hub.Frame
-		_ = c.ws.SetReadDeadline(time.Now().Add(120 * time.Second)) // 略长于 pingInterval*3
-		if err := c.ws.ReadJSON(&f); err != nil {
-			return // EOF / 超时 / 网络错误：退出，defer 会 Close()
+		_ = cn.ws.SetReadDeadline(time.Now().Add(120 * time.Second)) // 略长于 pingInterval*3
+		if err := cn.ws.ReadJSON(&f); err != nil {
+			return // EOF / 超时 / 网络错误：退出，defer 收尾
 		}
-		c.handleFrame(f)
+		c.handleFrame(cn, f)
 	}
 }
 
-func (c *Client) handleFrame(f hub.Frame) {
+func (c *Client) handleFrame(cn *conn, f hub.Frame) {
 	switch f.Type {
 	case "msg.new":
 		var m Message
@@ -371,7 +399,7 @@ func (c *Client) handleFrame(f hub.Frame) {
 		}
 		// 自动回 ack（幂等），走 sendCh 串行化
 		ackD, _ := json.Marshal(map[string]any{"seq": m.Seq})
-		c.sendFrame(hub.Frame{V: 1, Type: "msg.ack", Data: ackD})
+		c.sendFrameOn(cn, hub.Frame{V: 1, Type: "msg.ack", Data: ackD})
 		c.emit(Event{Type: EventMessage, Message: &m})
 
 	case "msg.ack":
@@ -444,7 +472,7 @@ func (c *Client) handleFrame(f hub.Frame) {
 		}
 
 	case "ping":
-		c.sendFrame(hub.Frame{V: 1, Type: "pong"})
+		c.sendFrameOn(cn, hub.Frame{V: 1, Type: "pong"})
 
 	case "pong":
 		// writePump 的心跳回包，忽略
@@ -462,14 +490,18 @@ func (c *Client) SendText(body string) (int64, error) {
 
 // UploadImage HTTP 上传图片，返回 file_id、size（字节）。
 func (c *Client) UploadImage(filename string, data []byte) (fileID string, size int64, err error) {
-	if c.token == "" {
+	token := c.Token()
+	if token == "" {
 		return "", 0, errors.New("未鉴权，无 token")
 	}
 	u := c.server + "/api/files"
 	body := &multipartBody{data: data, filename: filename}
-	req, _ := http.NewRequest("POST", u, body)
+	req, err := http.NewRequest("POST", u, body)
+	if err != nil {
+		return "", 0, err
+	}
 	req.Header.Set("Content-Type", body.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := c.httpCli.Do(req)
 	if err != nil {
 		return "", 0, err
@@ -504,12 +536,13 @@ func (c *Client) SendImage(filename string, data []byte, w, h int) (int64, error
 
 // DownloadImage 按 file_id 下载字节。
 func (c *Client) DownloadImage(fileID string) ([]byte, error) {
-	if c.token == "" {
+	token := c.Token()
+	if token == "" {
 		return nil, errors.New("未鉴权")
 	}
-	u := c.server + "/api/files/" + url.PathEscape(fileID) + "?token=" + c.token
+	u := c.server + "/api/files/" + url.PathEscape(fileID) + "?token=" + token
 	req, _ := http.NewRequest("GET", u, nil)
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := c.httpCli.Do(req)
 	if err != nil {
 		return nil, err
@@ -524,7 +557,8 @@ func (c *Client) DownloadImage(fileID string) ([]byte, error) {
 
 // Sync 增量拉取 seq > after 的消息。limit 最大 200。hasMore 为 true 时继续拉。
 func (c *Client) Sync(after int64, limit int) (*SyncResult, error) {
-	if !c.Connected() {
+	cn := c.currentConn()
+	if cn == nil {
 		return nil, errors.New("未连接")
 	}
 	if limit <= 0 || limit > 200 {
@@ -537,13 +571,24 @@ func (c *Client) Sync(after int64, limit int) (*SyncResult, error) {
 	c.pendingSync[reqID] = ch
 	c.muSync.Unlock()
 
-	if !c.sendFrame(hub.Frame{V: 1, Type: "sync", ID: reqID, TS: time.Now().UnixMilli(), Data: d}) {
+	if !c.sendFrameOn(cn, hub.Frame{V: 1, Type: "sync", ID: reqID, TS: time.Now().UnixMilli(), Data: d}) {
 		c.muSync.Lock()
 		delete(c.pendingSync, reqID)
 		c.muSync.Unlock()
 		return nil, errors.New("发送 sync 失败（连接可能已关闭）")
 	}
-	return c.waitForSync(reqID)
+	return c.waitForSync(cn, reqID)
+}
+
+// currentConn 返回当前活跃连接；未连接时返回 nil。
+func (c *Client) currentConn() *conn {
+	c.mu.Lock()
+	cn := c.cur
+	c.mu.Unlock()
+	if cn == nil || !c.connected.Load() {
+		return nil
+	}
+	return cn
 }
 
 // ---------- ack / sync 等待机制（Client 私有） ----------
@@ -556,7 +601,8 @@ func (c *Client) genRef() string {
 // 必须先注册等待器再投递帧：否则服务端回执可能先于注册到达 readLoop，
 // 被 resolvePendingAck 当作未知 ref 丢弃，调用方只能等满 ackTimeout 后误报超时。
 func (c *Client) sendAndWaitAck(f hub.Frame) (int64, error) {
-	if !c.Connected() {
+	cn := c.currentConn()
+	if cn == nil {
 		return 0, errors.New("未连接")
 	}
 
@@ -570,14 +616,14 @@ func (c *Client) sendAndWaitAck(f hub.Frame) (int64, error) {
 		c.muAck.Unlock()
 	}()
 
-	if !c.sendFrame(f) {
+	if !c.sendFrameOn(cn, f) {
 		return 0, errors.New("发送失败（连接可能已关闭）")
 	}
 
 	select {
 	case r := <-ch:
 		return r.Seq, r.Err
-	case <-c.closeCh:
+	case <-cn.closeCh:
 		return 0, errors.New("连接已关闭")
 	case <-time.After(ackTimeout):
 		return 0, errors.New("等待 msg.ack 超时")
@@ -600,7 +646,7 @@ func (c *Client) resolvePendingAck(ref string, seq int64, err error) {
 	}
 }
 
-func (c *Client) waitForSync(id string) (*SyncResult, error) {
+func (c *Client) waitForSync(cn *conn, id string) (*SyncResult, error) {
 	c.muSync.Lock()
 	ch, ok := c.pendingSync[id]
 	c.muSync.Unlock()
@@ -610,7 +656,7 @@ func (c *Client) waitForSync(id string) (*SyncResult, error) {
 	select {
 	case r := <-ch:
 		return r, nil
-	case <-c.closeCh:
+	case <-cn.closeCh:
 		return nil, errors.New("连接已关闭")
 	case <-time.After(syncTimeout):
 		c.muSync.Lock()
@@ -622,9 +668,24 @@ func (c *Client) waitForSync(id string) (*SyncResult, error) {
 
 // ---------- 只读访问器 ----------
 
-func (c *Client) Role() string    { return c.role }
-func (c *Client) DeviceID() string { return c.deviceID }
-func (c *Client) Token() string   { return c.token }
+func (c *Client) Role() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.role
+}
+
+func (c *Client) DeviceID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deviceID
+}
+
+func (c *Client) Token() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.token
+}
+
 func (c *Client) Server() string  { return c.server }
 func (c *Client) Connected() bool { return c.connected.Load() }
 func (c *Client) LastSeq() int64  { return atomic.LoadInt64(&c.lastSeq) }
