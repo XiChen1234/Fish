@@ -29,41 +29,108 @@ jobs:
           go build -trimpath -ldflags "-s -w" -o dist/fish-server ./cmd/server
           echo "Binary size: $(stat -c%s dist/fish-server) bytes"
 
-      - name: Upload binary & restart service
+      - name: Ensure config.json exists on server
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          port: ${{ secrets.DEPLOY_PORT || 22 }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          host: ${{ secrets.SERVER_HOST }}
+          port: 22
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            if [ ! -f /opt/fish/config.json ]; then
+              echo "✗ /opt/fish/config.json 不存在"
+              echo "  请先在服务器上执行一次："
+              echo "    sudo mkdir -p /opt/fish"
+              echo "    sudo tee /opt/fish/config.json <<'EOF'"
+              echo '    {'
+              echo '      "listen": ":19090",'
+              echo '      "data_dir": "./data",'
+              echo '      "endpoints": ['
+              echo '        { "id": "a", "token": "<你的token-a>" },'
+              echo '        { "id": "b", "token": "<你的token-b>" }'
+              echo '      ]'
+              echo '    }'
+              echo '    EOF'
+              echo "    sudo chown fish:fish /opt/fish/config.json"
+              exit 1
+            fi
+            echo "✓ config.json 已就绪"
+
+      - name: Idempotent init + upload + restart
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          port: 22
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
           script_stop: true
-          # 先备份当前二进制，再上传新文件，再重启服务
           scp: true
           scp_file: dist/fish-server
           scp_target: /opt/fish/fish-server.new
           script: |
             set -e
-            # 备份（不存在则跳过）
+
+            # ---------- 1. 幂等初始化（第一次部署自动完成，后续幂等 no-op） ----------
+            # 创建运行用户
+            if ! id -u fish &>/dev/null; then
+              useradd --system --no-create-home --shell /usr/sbin/nologin fish
+              echo "+ 创建 fish 用户"
+            fi
+            # 部署目录
+            mkdir -p /opt/fish
+            # systemd 服务单元（每次都覆盖，保证和仓库 deploy/fish.service 一致）
+            cat > /etc/systemd/system/fish.service <<'UNIT'
+            [Unit]
+            Description=Fish private messaging server (single user, two endpoints)
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=simple
+            WorkingDirectory=/opt/fish
+            ExecStart=/opt/fish/fish-server -config /opt/fish/config.json
+            Restart=on-failure
+            RestartSec=3
+            MemoryMax=256M
+            CPUQuota=100%
+            User=fish
+            Group=fish
+            NoNewPrivileges=true
+            ProtectSystem=strict
+            ReadWritePaths=/opt/fish
+            PrivateTmp=true
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            echo "+ systemd 单元就绪"
+
+            # ---------- 2. 上传并原子替换 ----------
             if [ -f /opt/fish/fish-server ]; then
               cp -a /opt/fish/fish-server /opt/fish/fish-server.bak
             fi
-            # 原子替换
             mv /opt/fish/fish-server.new /opt/fish/fish-server
             chmod 755 /opt/fish/fish-server
-            # systemd 重启；若服务尚未安装，提示用户先跑 server-init.sh
-            if systemctl is-enabled fish >/dev/null 2>&1; then
-              systemctl restart fish
-              sleep 2
-              if systemctl is-active fish >/dev/null 2>&1; then
-                echo "✓ fish 启动成功"
-                systemctl --no-pager --full status fish | head -10
-              else
-                echo "✗ fish 启动失败，回滚..."
-                journalctl -u fish --no-pager -n 30 || true
-                mv /opt/fish/fish-server.bak /opt/fish/fish-server
-                systemctl restart fish
-                exit 1
-              fi
+            chown -R fish:fish /opt/fish
+            echo "+ 二进制已替换"
+
+            # ---------- 3. 启用开机自启 + 重启 ----------
+            systemctl enable fish
+            systemctl restart fish
+            sleep 2
+
+            if systemctl is-active fish >/dev/null 2>&1; then
+              echo "✓ fish 启动成功"
+              systemctl --no-pager --full status fish | head -8
             else
-              echo "⚠ fish 服务未安装，请先在服务器上运行 deploy/server-init.sh"
+              echo "✗ fish 启动失败，回滚..."
+              journalctl -u fish --no-pager -n 30 || true
+              if [ -f /opt/fish/fish-server.bak ]; then
+                mv /opt/fish/fish-server.bak /opt/fish/fish-server
+                chmod 755 /opt/fish/fish-server
+                systemctl restart fish || true
+                echo "+ 已回滚到备份二进制"
+              fi
+              exit 1
             fi
