@@ -51,17 +51,23 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script_stop: true
+          debug: true
+          command_timeout: 3m
           script: |
             set -e
+
+            # 诊断信息输出到 stderr，确保在 Actions 日志中以 err: 前缀可见
+            echo "[deploy] start user=$(id -un) uid=$(id -u)" >&2
 
             # ---------- 0. 权限检查：root 或免密 sudo ----------
             if [ "$(id -u)" -eq 0 ]; then
               SUDO=""
             elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
               SUDO="sudo -n"
+              echo "[deploy] 使用免密 sudo 执行特权操作" >&2
             else
-              echo "✗ 部署用户 $(id -un) 不是 root，且没有免密 sudo 权限"
-              echo "  请把 SERVER_USER 改为 root，或为该用户配置 NOPASSWD 的 sudo"
+              echo "✗ 部署用户 $(id -un) 不是 root，且没有免密 sudo 权限" >&2
+              echo "  请把 SERVER_USER 改为 root，或为该用户配置 NOPASSWD 的 sudo" >&2
               exit 1
             fi
 
