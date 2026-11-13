@@ -1,0 +1,32 @@
+# Fish 私信系统 systemd 服务单元
+# 安装：
+#   sudo cp fish.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fish
+# 前提：二进制已放置 /opt/fish/fish-server，且已在该目录启动过一次以生成 config.json
+
+[Unit]
+Description=Fish private messaging server (single user, two endpoints)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/fish
+ExecStart=/opt/fish/fish-server -config /opt/fish/config.json
+Restart=on-failure
+RestartSec=3
+
+# 资源上限（2C2G 服务器）
+MemoryMax=256M
+CPUQuota=100%
+
+# 安全加固（服务以普通用户运行，无特权）
+User=fish
+Group=fish
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/fish
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
