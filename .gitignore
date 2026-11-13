@@ -6,7 +6,7 @@
 *.db-shm
 *.db-wal
 
-# 本地真实配置（含 token），模板见 config.example.json
+# 本地配置文件（可选，服务不依赖它也能启动）
 /config.json
 
 # 测试跑出来的残留文件

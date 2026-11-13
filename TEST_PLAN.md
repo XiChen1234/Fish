@@ -12,18 +12,19 @@
 # 构建
 go build -o dist\fish-server.exe .\cmd\server
 
-# 准备 config.json（endpoints 字段已在动态配对体系下弃用，可留空数组或省略）
-# 最简模板：
-{
-  "listen": ":19090",
-  "data_dir": "./data"
-}
+# 直接启动（无需 config.json；默认 listen :8080，这里用 -listen 指定测试端口）
+.\dist\fish-server.exe -listen :19090 -data-dir .\data
 
-# 启动
-.\dist\fish-server.exe -config config.json
+# 等价写法：环境变量（优先级低于命令行参数）
+$env:FISH_LISTEN = ':19090'; $env:FISH_DATA_DIR = '.\data'
+.\dist\fish-server.exe
+
+# 如需自定义大小上限，仍可放一个只写覆盖字段的 config.json：
+# { "max_file_bytes": 20971520 }
+.\dist\fish-server.exe -config config.json -listen :19090
 ```
 
-**首次启动**会在 `data_dir/jwt.key` 生成 32 字节 HMAC 密钥（持久化，重启不失效）。`data_dir/fish.db` 自动创建，空库。
+**首次启动**会在 `data_dir/jwt.key` 生成 32 字节 HMAC 密钥（持久化，重启不失效）。`data_dir/fish.db` 自动创建，空库。配置文件缺失不再导致启动失败。
 
 ### 2. 清空旧数据库（切到新鉴权体系后，旧预设 token 时代的 db 无意义）
 
@@ -169,4 +170,4 @@ go test -timeout 180s ./...
 | 服务重启后 JWT key 重新生成 → 旧 token 失效 | 删掉了 `data/jwt.key` 才会重新生成；如果想保持 token 有效**不要删这个文件** |
 | 图片上传 400 | 真图片才过（服务端嗅探魔数，改扩展名无效）；或 >10MB |
 | 端口被占用 | Windows 查 `netstat -ano \| findstr :19090` 找 PID → `Stop-Process -Id PID -Force` |
-| 服务端启动报 `endpoints 必须恰好配置 2 个` | config.json 还是旧模板。删掉 `endpoints` 字段或改为空数组 `[]` 即可。动态配对体系已不再需要预设 token |
+| 改了环境变量但端口没变 | 命令行 `-listen` 优先级最高；再确认 systemd 单元里的 `-listen`/`FISH_LISTEN` |

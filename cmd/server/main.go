@@ -21,14 +21,30 @@ import (
 )
 
 func main() {
-	cfgPath := flag.String("config", "config.json", "配置文件路径")
+	// 配置文件是可选的：不指定也能启动（默认值 + 环境变量）。
+	cfgPath := flag.String("config", config.ConfigPath("config.json"), "配置文件路径（可选，不存在时使用默认值）")
+	listen := flag.String("listen", "", "监听地址，覆盖配置文件/环境变量，如 :19090")
+	dataDir := flag.String("data-dir", "", "数据目录，覆盖配置文件/环境变量")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
-	log.Printf("配置加载成功: listen=%s data_dir=%s", cfg.Listen, cfg.DataDir)
+	if *listen != "" {
+		cfg.Listen = *listen
+	}
+	if *dataDir != "" {
+		cfg.DataDir = *dataDir
+	}
+	cfgFile := "无（默认值 + 环境变量）"
+	if *cfgPath != "" {
+		if _, statErr := os.Stat(*cfgPath); statErr == nil {
+			cfgFile = *cfgPath
+		}
+	}
+	log.Printf("配置就绪: listen=%s data_dir=%s max_text=%dB max_file=%dB（配置文件: %s）",
+		cfg.Listen, cfg.DataDir, cfg.MaxTextBytes, cfg.MaxFileBytes, cfgFile)
 
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		log.Fatalf("创建数据目录失败: %v", err)
