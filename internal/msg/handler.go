@@ -3,6 +3,7 @@ package msg
 import (
 	"encoding/json"
 	"log"
+	"strconv"
 	"time"
 
 	"fish/internal/auth"
@@ -35,6 +36,10 @@ func New(st *store.Store, h *hub.Hub, cfg *config.Config) *Handler {
 }
 
 func (h *Handler) Handle(c *hub.Conn, f hub.Frame) {
+	if f.V != 1 {
+		h.sendError(c, CodeBadRequest, "不支持的协议版本: "+strconv.Itoa(f.V), f.ID)
+		return
+	}
 	switch f.Type {
 	case "msg.send":
 		h.onSend(c, f)

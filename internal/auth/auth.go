@@ -18,13 +18,14 @@ import (
 
 // 错误码（供上层使用）。
 var (
-	ErrRoomExists    = errors.New("房间已初始化，请使用 login")
-	ErrRoomNotInit   = errors.New("房间未初始化，请使用 init 设置密码")
-	ErrBadPassword   = errors.New("密码错误")
-	ErrBadRole       = errors.New("role 必须为 A 或 B")
-	ErrPasswordEmpty = errors.New("密码不能为空")
-	ErrDeviceEmpty   = errors.New("device_id 不能为空")
-	ErrInvalidToken  = errors.New("token 无效")
+	ErrRoomExists     = errors.New("房间已初始化，请使用 login")
+	ErrRoomNotInit    = errors.New("房间未初始化，请使用 init 设置密码")
+	ErrBadPassword    = errors.New("密码错误")
+	ErrBadRole        = errors.New("role 必须为 A 或 B")
+	ErrPasswordEmpty  = errors.New("密码不能为空")
+	ErrDeviceEmpty    = errors.New("device_id 不能为空")
+	ErrInvalidToken   = errors.New("token 无效")
+	ErrDeviceMismatch = errors.New("device_id 与 token 不匹配")
 )
 
 const (
@@ -34,9 +35,9 @@ const (
 
 // Auth 动态鉴权管理器（基于 store，无预设 token）。
 type Auth struct {
-	store   *store.Store
-	jwtKey  []byte // 32+ 字节随机密钥，首次启动时生成并持久化（简单起见这里内联生成）
-	jwtExp  time.Duration
+	store  *store.Store
+	jwtKey []byte // 32+ 字节随机密钥，首次启动时生成并持久化（简单起见这里内联生成）
+	jwtExp time.Duration
 }
 
 // New 创建 Auth。jwtKey 为 HMAC 签名密钥；传 nil 则自动生成（进程重启后失效，
@@ -145,6 +146,27 @@ func (a *Auth) registerDevice(deviceID, role string) (string, string, error) {
 
 // ---------- Token 验证 ----------
 
+// Resume 用已有 token 恢复连接。deviceID 为空时从 token 内取设备标识。
+// 校验点：token 有效、device_id 与 token 一致、设备仍已注册且角色一致、
+// token 仍是该设备当前 token（登录换发新 token 后旧 token 自动失效）。
+func (a *Auth) Resume(deviceID, token string) (role, devID, tok string, err error) {
+	r, did, ok := a.Verify(token)
+	if !ok {
+		return "", "", "", ErrInvalidToken
+	}
+	if deviceID != "" && deviceID != did {
+		return "", "", "", ErrDeviceMismatch
+	}
+	dev, err := a.store.GetDevice(did)
+	if err != nil {
+		return "", "", "", err
+	}
+	if dev == nil || dev.Role != r || dev.Token != token {
+		return "", "", "", ErrInvalidToken
+	}
+	return r, did, token, nil
+}
+
 // Verify 验证 JWT，返回 (role, deviceID, ok)。
 // token 无效/过期返回 ("","",false)。
 func (a *Auth) Verify(token string) (role, deviceID string, ok bool) {
@@ -203,12 +225,16 @@ type jwtClaims struct {
 
 func (a *Auth) sign(role, deviceID string) (string, error) {
 	now := time.Now()
+	// jti 随机化：同一秒内重复登录也能换发出不同 token，旧 token 随即失效
+	jti := make([]byte, 8)
+	_, _ = rand.Read(jti)
 	claims := jwtClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(a.jwtExp)),
 			Subject:   deviceID,
 			Issuer:    "fish",
+			ID:        hex.EncodeToString(jti),
 		},
 		Role:     role,
 		DeviceID: deviceID,

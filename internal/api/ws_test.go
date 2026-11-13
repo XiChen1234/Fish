@@ -55,9 +55,16 @@ func readFrame(t *testing.T, ws *websocket.Conn) hub.Frame {
 	return f
 }
 
-// dialWS 握手并发送 auth 帧，返回已就绪 WS 连接。
-// 调用方负责 close。
-func dialWS(t *testing.T, ts *httptest.Server, deviceID, password, action, desiredRole string) *websocket.Conn {
+type authResult struct {
+	Success  bool   `json:"success"`
+	Error    string `json:"error"`
+	Role     string `json:"role"`
+	DeviceID string `json:"device_id"`
+	Token    string `json:"token"`
+}
+
+// dialWSFull 握手并发送 auth 帧，返回连接与 auth.result 内容（不校验成功与否）。
+func dialWSFull(t *testing.T, ts *httptest.Server, deviceID, password, action, desiredRole, token string) (*websocket.Conn, authResult) {
 	t.Helper()
 	ws, _, err := websocket.DefaultDialer.Dial(wsURL(ts), nil)
 	if err != nil {
@@ -68,22 +75,96 @@ func dialWS(t *testing.T, ts *httptest.Server, deviceID, password, action, desir
 		"password":     password,
 		"action":       action,
 		"desired_role": desiredRole,
+		"token":        token,
 	})
 	_ = ws.WriteJSON(hub.Frame{V: 1, Type: "auth", Data: authData})
 	f := readFrame(t, ws)
 	if f.Type != "auth.result" {
+		ws.Close()
 		t.Fatalf("期望 auth.result, got %s", f.Type)
 	}
-	var res struct {
-		Success bool   `json:"success"`
-		Error   string `json:"error"`
-		Role    string `json:"role"`
-	}
+	var res authResult
 	_ = json.Unmarshal(f.Data, &res)
+	return ws, res
+}
+
+// dialWS 握手并发送 auth 帧，返回已就绪 WS 连接。
+// 调用方负责 close。
+func dialWS(t *testing.T, ts *httptest.Server, deviceID, password, action, desiredRole string) *websocket.Conn {
+	t.Helper()
+	ws, res := dialWSFull(t, ts, deviceID, password, action, desiredRole, "")
 	if !res.Success {
+		ws.Close()
 		t.Fatalf("auth 失败: %s", res.Error)
 	}
 	return ws
+}
+
+// resume 必须校验 device_id 与设备/token 的一致性。
+func TestWS_ResumeValidation(t *testing.T) {
+	ts := newTestServer(t)
+	wsA, resA := dialWSFull(t, ts, "dev-a", "secret1234", "init", "", "")
+	defer wsA.Close()
+	if !resA.Success || resA.Token == "" {
+		t.Fatalf("init 失败: %+v", resA)
+	}
+
+	// 1) device_id 与 token 不匹配应被拒绝
+	ws1, r1 := dialWSFull(t, ts, "dev-x", "", "resume", "", resA.Token)
+	ws1.Close()
+	if r1.Success {
+		t.Fatal("device_id 与 token 不匹配应失败")
+	}
+
+	// 2) device_id 留空时由服务端从 token 解析
+	ws2, r2 := dialWSFull(t, ts, "", "", "resume", "", resA.Token)
+	defer ws2.Close()
+	if !r2.Success {
+		t.Fatalf("合法 token resume 应成功: %s", r2.Error)
+	}
+	if r2.DeviceID != "dev-a" || r2.Role != "A" {
+		t.Fatalf("应回填 device_id=dev-a role=A, got %q/%q", r2.DeviceID, r2.Role)
+	}
+
+	// 3) 非法 token 应被拒绝
+	ws3, r3 := dialWSFull(t, ts, "", "", "resume", "", "not-a-jwt")
+	ws3.Close()
+	if r3.Success {
+		t.Fatal("非法 token 应失败")
+	}
+
+	// 4) 重新登录换发 token 后，旧 token 失效
+	ws4, r4 := dialWSFull(t, ts, "dev-a", "secret1234", "login", "", "")
+	defer ws4.Close()
+	if !r4.Success || r4.Token == resA.Token {
+		t.Fatalf("重新登录应换发新 token: %+v", r4)
+	}
+	ws5, r5 := dialWSFull(t, ts, "dev-a", "", "resume", "", resA.Token)
+	ws5.Close()
+	if r5.Success {
+		t.Fatal("换发后的旧 token 应失效")
+	}
+}
+
+// 非 v=1 的业务帧应返回 4003 错误。
+func TestWS_FrameVersionRejected(t *testing.T) {
+	ts := newTestServer(t)
+	ws := dialWS(t, ts, "dev-a", "secret1234", "init", "")
+	defer ws.Close()
+
+	data, _ := json.Marshal(map[string]any{"kind": "text", "body": "hi"})
+	_ = ws.WriteJSON(hub.Frame{V: 2, Type: "msg.send", ID: "v2", Data: data})
+	f := readFrame(t, ws)
+	if f.Type != "error" {
+		t.Fatalf("期望 error 帧, got %s", f.Type)
+	}
+	var e struct {
+		Code int `json:"code"`
+	}
+	_ = json.Unmarshal(f.Data, &e)
+	if e.Code != 4003 {
+		t.Fatalf("期望 code=4003, got %d", e.Code)
+	}
 }
 
 // init 首台设备应拿到 role A。

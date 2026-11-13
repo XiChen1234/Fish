@@ -190,7 +190,8 @@ func (c *Client) Connect(opts ConnectOptions) error {
 	c.mu.Lock()
 	if opts.DeviceID != "" {
 		c.deviceID = opts.DeviceID
-	} else if c.deviceID == "" {
+	} else if opts.Action != ActionResume && c.deviceID == "" {
+		// resume 时 device_id 留空由服务端从 token 中解析，避免随机 ID 与 token 不匹配
 		c.deviceID = RandDeviceID()
 	}
 	if opts.Action == ActionResume && opts.Token != "" {

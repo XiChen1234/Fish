@@ -62,9 +62,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleWS WS 握手 + 帧内 auth 流程：
 // 1. HTTP → WS 升级（不做 HTTP 层鉴权，auth 放到 WS 帧里）
 // 2. 读取首个帧，类型必须为 "auth"
-//    - action="init"：房间初始化（首次连接）
-//    - action="login"：密码登录（房间已存在）
-//    - action="resume"：用已有 token 恢复连接
+//   - action="init"：房间初始化（首次连接）
+//   - action="login"：密码登录（房间已存在）
+//   - action="resume"：用已有 token 恢复连接
+//
 // 3. 鉴权成功后写 auth.result 帧，再 NewConn + Hub.Run 进入业务循环
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	ws, err := wsUpgrader.Upgrade(w, r, nil)
@@ -85,11 +86,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 解析请求以拿到 device_id（Auth 方法内部也会再解析一次校验字段）
-	var req authReq
-	_ = json.Unmarshal(f.Data, &req)
-
-	role, token, err := s.doAuth(ws, f)
+	role, deviceID, token, err := s.doAuth(f)
 	if err != nil {
 		s.writeAuthError(ws, err.Error())
 		return
@@ -107,38 +104,36 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		lastSeq = s.hub.LastSeq()
 	}
 	resData, _ := json.Marshal(map[string]any{
-		"success":    true,
-		"role":       role,
-		"device_id":  req.DeviceID,
-		"token":      token,
+		"success":     true,
+		"role":        role,
+		"device_id":   deviceID,
+		"token":       token,
 		"peer_online": peerOnline,
-		"last_seq":   lastSeq,
+		"last_seq":    lastSeq,
 	})
 	_ = ws.WriteJSON(hub.Frame{V: 1, Type: "auth.result", TS: time.Now().UnixMilli(), Data: resData})
 
-	c := hub.NewConn(role, req.DeviceID, ws)
+	c := hub.NewConn(role, deviceID, ws)
 	s.hub.Run(c)
 }
 
-func (s *Server) doAuth(ws *websocket.Conn, f hub.Frame) (role, token string, err error) {
+func (s *Server) doAuth(f hub.Frame) (role, deviceID, token string, err error) {
 	var req authReq
 	if err := json.Unmarshal(f.Data, &req); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	switch req.Action {
 	case "init":
-		return s.auth.Init(req.DeviceID, req.Password)
+		r, tok, err := s.auth.Init(req.DeviceID, req.Password)
+		return r, req.DeviceID, tok, err
 	case "login":
-		return s.auth.Login(req.DeviceID, req.Password, req.DesiredRole)
+		r, tok, err := s.auth.Login(req.DeviceID, req.Password, req.DesiredRole)
+		return r, req.DeviceID, tok, err
 	case "resume":
-		// 用已有 token 恢复（重连时避免重复密码校验）
-		r, _, ok := s.auth.Verify(req.Token)
-		if !ok {
-			return "", "", auth.ErrInvalidToken
-		}
-		return r, req.Token, nil
+		// 用已有 token 恢复，校验设备仍存在且 token 未被换发
+		return s.auth.Resume(req.DeviceID, req.Token)
 	default:
-		return "", "", errors.New("未知 action: " + req.Action)
+		return "", "", "", errors.New("未知 action: " + req.Action)
 	}
 }
 

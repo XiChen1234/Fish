@@ -24,9 +24,9 @@ func newTestServer(t *testing.T) (*httptest.Server, *store.Store, *hub.Hub) {
 	t.Helper()
 	dataDir := t.TempDir()
 	cfg := &config.Config{
-		DataDir:       dataDir,
-		MaxTextBytes:  config.DefaultMaxTextBytes,
-		MaxFileBytes:  config.DefaultMaxFileBytes,
+		DataDir:      dataDir,
+		MaxTextBytes: config.DefaultMaxTextBytes,
+		MaxFileBytes: config.DefaultMaxFileBytes,
 	}
 	st, err := store.Open(filepath.Join(dataDir, "test.db"))
 	if err != nil {
@@ -244,11 +244,12 @@ func TestConcurrentMultiDeviceSend(t *testing.T) {
 	a1 := client.New(ts.URL, nil)
 	_ = a1.Connect(client.ConnectOptions{DeviceID: "dev-a1", Password: "secret1234", Action: client.ActionInit})
 	defer a1.Close()
-	tokenA1 := a1.Token()
 
-	// A2 用同一 token resume（多设备同 role A）
+	// A2 登录为同 role A（多设备同 role）
 	a2 := client.New(ts.URL, nil)
-	_ = a2.Connect(client.ConnectOptions{DeviceID: "dev-a2", Password: "", Action: client.ActionResume, Token: tokenA1})
+	if err := a2.Connect(client.ConnectOptions{DeviceID: "dev-a2", Password: "secret1234", Action: client.ActionLogin, DesiredRole: "A"}); err != nil {
+		t.Fatalf("A2 login: %v", err)
+	}
 	defer a2.Close()
 
 	// A1 和 A2 并发各发 10 条
