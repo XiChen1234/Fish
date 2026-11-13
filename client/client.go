@@ -455,13 +455,9 @@ func (c *Client) handleFrame(f hub.Frame) {
 
 // SendText 发送文本。返回服务端分配的 seq（>0）。
 func (c *Client) SendText(body string) (int64, error) {
-	if !c.Connected() {
-		return 0, errors.New("未连接")
-	}
 	d, _ := json.Marshal(map[string]any{"kind": "text", "body": body})
 	id := c.genRef()
-	c.sendFrame(hub.Frame{V: 1, Type: "msg.send", ID: id, TS: time.Now().UnixMilli(), Data: d})
-	return c.waitForAck(id)
+	return c.sendAndWaitAck(hub.Frame{V: 1, Type: "msg.send", ID: id, TS: time.Now().UnixMilli(), Data: d})
 }
 
 // UploadImage HTTP 上传图片，返回 file_id、size（字节）。
@@ -503,8 +499,7 @@ func (c *Client) SendImage(filename string, data []byte, w, h int) (int64, error
 		"kind": "image", "file_id": fileID, "w": w, "h": h, "size": size,
 	})
 	id := c.genRef()
-	c.sendFrame(hub.Frame{V: 1, Type: "msg.send", ID: id, TS: time.Now().UnixMilli(), Data: d})
-	return c.waitForAck(id)
+	return c.sendAndWaitAck(hub.Frame{V: 1, Type: "msg.send", ID: id, TS: time.Now().UnixMilli(), Data: d})
 }
 
 // DownloadImage 按 file_id 下载字节。
@@ -557,17 +552,27 @@ func (c *Client) genRef() string {
 	return "ref-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 }
 
-func (c *Client) waitForAck(ref string) (int64, error) {
+// sendAndWaitAck 发送 msg.send 并等待 msg.ack。
+// 必须先注册等待器再投递帧：否则服务端回执可能先于注册到达 readLoop，
+// 被 resolvePendingAck 当作未知 ref 丢弃，调用方只能等满 ackTimeout 后误报超时。
+func (c *Client) sendAndWaitAck(f hub.Frame) (int64, error) {
+	if !c.Connected() {
+		return 0, errors.New("未连接")
+	}
+
 	ch := make(chan ackResult, 1)
-	entry := &ackWaiter{ch: ch, ref: ref}
 	c.muAck.Lock()
-	c.pendingAck[ref] = entry
+	c.pendingAck[f.ID] = &ackWaiter{ch: ch, ref: f.ID}
 	c.muAck.Unlock()
 	defer func() {
 		c.muAck.Lock()
-		delete(c.pendingAck, ref)
+		delete(c.pendingAck, f.ID)
 		c.muAck.Unlock()
 	}()
+
+	if !c.sendFrame(f) {
+		return 0, errors.New("发送失败（连接可能已关闭）")
+	}
 
 	select {
 	case r := <-ch:
