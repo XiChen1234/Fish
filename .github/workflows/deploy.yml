@@ -19,7 +19,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.23
+          go-version-file: go.mod
 
       - name: Build linux-amd64 binary
         env:
@@ -29,7 +29,20 @@ jobs:
           go build -trimpath -ldflags "-s -w" -o dist/fish-server ./cmd/server
           echo "Binary size: $(stat -c%s dist/fish-server) bytes"
 
-      - name: Idempotent init + upload + restart
+      # 先上传到临时目录，再由远程脚本原子替换 /opt/fish/fish-server
+      - name: Upload binary to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          port: 22
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: dist/fish-server
+          target: /tmp/fish-upload
+          strip_components: 1
+          overwrite: true
+
+      - name: Idempotent init + replace + restart
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -37,9 +50,6 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script_stop: true
-          scp: true
-          scp_file: dist/fish-server
-          scp_target: /opt/fish/fish-server.new
           script: |
             set -e
 
@@ -82,9 +92,15 @@ jobs:
             echo "+ systemd 单元就绪"
 
             # ---------- 2. 原子替换 ----------
+            if [ ! -f /tmp/fish-upload/fish-server ]; then
+              echo "✗ 未找到上传的二进制 /tmp/fish-upload/fish-server"
+              exit 1
+            fi
             if [ -f /opt/fish/fish-server ]; then
               cp -a /opt/fish/fish-server /opt/fish/fish-server.bak
             fi
+            mv /tmp/fish-upload/fish-server /opt/fish/fish-server.new
+            # 同分区 rename 才是原子替换；跨分区（/tmp → /opt）先落到 .new 再 rename
             mv /opt/fish/fish-server.new /opt/fish/fish-server
             chmod 755 /opt/fish/fish-server
             chown fish:fish /opt/fish/fish-server
