@@ -31,21 +31,28 @@
   /* 配置面板 */
   #setup {
     margin: auto; background: var(--panel); padding: 28px; border-radius: 12px;
-    width: min(360px, 90vw); display: flex; flex-direction: column; gap: 12px;
+    width: min(400px, 92vw); display: flex; flex-direction: column; gap: 12px;
     border: 1px solid #2a3441;
   }
   #setup h2 { font-size: 15px; }
   #setup label { font-size: 12px; color: var(--muted); }
-  #setup input {
+  #setup input, #setup select {
     background: var(--panel2); border: 1px solid #32404e; color: var(--text);
     border-radius: 6px; padding: 8px 10px; font-size: 13px;
   }
-  #setup input:focus { outline: none; border-color: var(--accent); }
-  #setup button {
+  #setup input:focus, #setup select:focus { outline: none; border-color: var(--accent); }
+  #setup button.primary {
     background: var(--accent); color: #fff; border: none; border-radius: 6px;
     padding: 9px; font-size: 14px; cursor: pointer; margin-top: 4px;
   }
+  #setup button.primary:hover { filter: brightness(1.1); }
+  #setup button.secondary {
+    background: transparent; color: var(--accent); border: 1px solid var(--accent);
+    border-radius: 6px; padding: 7px; font-size: 13px; cursor: pointer;
+  }
+  #setup .row2 { display: flex; gap: 8px; }
   #setup .hint { font-size: 11px; color: var(--muted); line-height: 1.6; }
+  #setup .err { font-size: 12px; color: var(--err); min-height: 14px; }
 
   /* 聊天区 */
   #chat { display: none; flex-direction: column; flex: 1; min-height: 0; }
@@ -59,7 +66,6 @@
   .row.mine .bubble { background: var(--mine); }
   .bubble img { max-width: 100%; max-height: 300px; border-radius: 6px; display: block; cursor: pointer; }
   .meta { font-size: 10px; color: var(--muted); margin-top: 3px; }
-  #more { margin: 4px auto; font-size: 12px; color: var(--accent); background: none; border: none; cursor: pointer; }
 
   footer { display: flex; gap: 8px; padding: 12px 16px; background: var(--panel); border-top: 1px solid #2a3441; }
   #input {
@@ -83,7 +89,7 @@
     <h1>Fish 私信</h1>
     <span id="status"><span class="dot"></span>未连接</span>
     <span class="spacer"></span>
-    <button id="toggle-setup" style="display:none">连接设置</button>
+    <button id="toggle-setup" style="display:none">设置</button>
   </header>
 
   <!-- 配置面板 -->
@@ -91,16 +97,28 @@
     <h2>连接服务器</h2>
     <div>
       <label>服务器地址</label>
-      <input id="addr" placeholder="http://服务器IP:8080">
+      <input id="addr" placeholder="http://服务器IP:19090">
     </div>
     <div>
-      <label>密钥（token）</label>
-      <input id="token" type="password" placeholder="config.json 中的 endpoints token">
+      <label>密码</label>
+      <input id="password" type="password" placeholder="首次输入将创建房间">
     </div>
-    <button id="connect">连接</button>
+    <div>
+      <label>身份（仅房间内 A/B 都已存在时需要）</label>
+      <select id="desired-role">
+        <option value="">自动分配</option>
+        <option value="A">角色 A</option>
+        <option value="B">角色 B</option>
+      </select>
+    </div>
+    <div class="row2">
+      <button id="btn-init" class="primary">创建新房间</button>
+      <button id="btn-login" class="secondary">已有房间，加入</button>
+    </div>
+    <div class="err" id="err-msg"></div>
     <p class="hint">
-      密钥见服务端 config.json 的 endpoints 列表。<br>
-      客户端 A、B 各自使用不同 token 登录即互为对端。
+      首次连接此服务器时点击「创建新房间」设置密码，你的设备会成为角色 A。<br>
+      之后 B 用相同密码点「加入」即可配对。同一密码房间允许多设备同时在线。
     </p>
   </div>
 
@@ -118,31 +136,39 @@
 <script>
 const $ = id => document.getElementById(id);
 const state = {
-  ws: null, token: '', you: '', peer: '', peerOnline: false,
-  ready: false,   // 是否已收到 ready（用于区分「鉴权/连通性失败」与「连上后掉线」）
-  // 本地已收到游标：必须与「已渲染的气泡」同生命周期，因此只存内存、不持久化。
-  // 刷新页面后 DOM 清空，游标必须归零，否则 sync 只拉增量，历史消息不再显示。
+  ws: null, token: '', deviceID: '', role: '', peer: '', peerOnline: false,
+  // 本地已收到游标：只存内存。刷新后 DOM 清空 → 游标归零 → 重连走全量拉取。
   localSeq: 0,
-  serverSeq: 0,   // 服务端当前最大 seq（仅用于判断是否落后）
-  syncing: false, // 是否正在补拉历史
+  syncing: false,
   pending: new Map() // 乐观气泡 ref -> bubble 元素
 };
 
-// ---- 本地记忆（只记地址与密钥，不记游标）----
+// ---- 本地记忆 ----
 function saveCfg() {
   localStorage.setItem('fish.cfg', JSON.stringify({
-    addr: $('addr').value, token: $('token').value
+    addr: $('addr').value,
+    deviceID: state.deviceID,
+    token: state.token,
+    role: state.role,
+    peer: state.peer
   }));
 }
 function loadCfg() {
   try { return JSON.parse(localStorage.getItem('fish.cfg')) || {}; } catch { return {}; }
 }
+function clearSavedAuth() { localStorage.removeItem('fish.cfg'); }
 
 // ---- 状态栏 ----
 function setStatus(on, text) {
   const el = $('status');
-  el.classList.toggle('on', on);
+  el.classList.toggle('on', !!on);
   el.innerHTML = `<span class="dot"></span>${text}`;
+}
+function updateStatus() {
+  const conn = state.ws && state.ws.readyState === 1;
+  const roleLabel = state.role ? `身份 ${state.role}` : '未连接';
+  const peerLabel = state.peer ? ` · 对端 ${state.peer} ${state.peerOnline ? '在线' : '离线'}` : '';
+  setStatus(conn, roleLabel + peerLabel);
 }
 
 // ---- 消息渲染 ----
@@ -166,7 +192,8 @@ function bubble(m, mine) {
   }
   const meta = document.createElement('div');
   meta.className = 'meta';
-  meta.textContent = `${mine ? '我' : (m.from === 'a' ? 'A' : 'B')} · ${fmtTime(m.ts)} · #${m.seq}`;
+  const who = mine ? '我' : ('角色 ' + m.from);
+  meta.textContent = `${who} · ${fmtTime(m.ts)} · #${m.seq}`;
   b.appendChild(meta);
   row.appendChild(b);
   return row;
@@ -175,106 +202,117 @@ function fmtTime(ts) {
   const d = ts ? new Date(ts) : new Date();
   return d.toLocaleTimeString('zh-CN', { hour12: false });
 }
-function fmtSize(n) {
-  if (!n) return '';
-  return n < 1024 ? n + 'B' : (n / 1024).toFixed(1) + 'KB';
-}
+function fmtSize(n) { return n < 1024 ? n + 'B' : (n / 1024).toFixed(1) + 'KB'; }
 function append(el) {
   $('msgs').appendChild(el);
   $('msgs').scrollTop = $('msgs').scrollHeight;
 }
 function apiBase() {
-  return document.getElementById('addr').value.trim().replace(/\/+$/, '');
+  return $('addr').value.trim().replace(/\/+$/, '');
 }
 
 // ---- 游标与去重 ----
-// 本地游标只做「连续性推进」：遇到空洞（seq 跳跃）时停在原处，
-// 后续由 sync 补回缺失消息后再依次推进，避免误跳过未收到的消息。
 function markSeq(seq) {
   if (!seq || seq === '…') return;
   if (seq <= state.localSeq || seq > state.localSeq + 1) return;
   state.localSeq = seq;
 }
-
-// 该 seq 是否已在页面上渲染过（重连补拉时避免重复气泡）
 function hasRendered(seq) {
   return !!$('msgs').querySelector('[data-seq="' + seq + '"]');
 }
-
-// 渲染一条服务端消息：按 seq 幂等去重，返回是否新渲染
 function receiveMessage(m) {
-  if (m.seq <= state.localSeq || hasRendered(m.seq)) {
-    markSeq(m.seq);
-    return false;
-  }
-  append(bubble(m, m.from === state.you));
+  if (m.seq <= state.localSeq || hasRendered(m.seq)) { markSeq(m.seq); return false; }
+  append(bubble(m, m.from === state.role));
   markSeq(m.seq);
   return true;
 }
 
-function updateStatus() {
-  setStatus(state.ws && state.ws.readyState === 1,
-    `身份 ${state.you.toUpperCase()} · 对端 ${state.peer.toUpperCase()} ${state.peerOnline ? '在线' : '离线'}`);
-}
+// ---- 连接（init / login / resume 共用）----
+function connect(action) {
+  const password = $('password').value.trim();
+  const desiredRole = $('desired-role').value;
 
-// ---- 连接 ----
-function connect() {
-  const token = $('token').value.trim();
-  if (!token) { alert('请输入密钥'); return; }
+  let did = state.deviceID;
+  let token = state.token;
 
-  // 游标与消息区必须同生命周期：切换身份时清空已渲染气泡并归零游标，
-  // 否则新身份的 sync 会从旧游标开始，漏掉它的历史消息。
-  if (token !== state.token) {
-    state.token = token;
-    state.localSeq = 0;
-    state.serverSeq = 0;
-    $('msgs').innerHTML = '';
+  // resume 模式：需要已有 token 和 device_id；否则必须提供密码
+  if (action === 'resume') {
+    if (!did || !token) {
+      // 本地没保存凭据，不应该走到这里
+      clearSavedAuth();
+      showSetup();
+      return;
+    }
+  } else {
+    if (!password) { showErr('请输入密码'); return; }
+    // init 动作不需要 desired_role，login 自动分配
+    if (action === 'login' && !did) {
+      did = genDeviceID();
+    } else if (!did) {
+      did = genDeviceID();
+    }
   }
+
+  showErr('');
+  state.ws && state.ws.close();
+  state.ws = null;
   state.syncing = false;
   state.pending.clear();
-  state.ready = false;
 
-  const wsURL = apiBase().replace(/^http/, 'ws') + '/ws?token=' + encodeURIComponent(state.token);
+  const wsURL = apiBase().replace(/^http/, 'ws') + '/ws';
   try { state.ws = new WebSocket(wsURL); }
-  catch (e) { alert('地址格式错误，应为 http://IP:端口'); return; }
+  catch (e) { showErr('地址格式错误，应为 http://IP:端口'); return; }
 
-  state.ws.onopen = () => setStatus(true, '已连接，等待就绪…');
-  state.ws.onmessage = ev => { try { handleFrame(JSON.parse(ev.data)); } catch {} };
+  let authSent = false;
+  state.ws.onopen = () => {
+    setStatus(true, '已连接，鉴权中…');
+    const authData = { device_id: did, action };
+    if (action !== 'resume') authData.password = password;
+    if (action === 'login' && desiredRole) authData.desired_role = desiredRole;
+    if (action === 'resume') authData.token = token;
+    authSent = true;
+    state.ws.send(JSON.stringify({ v: 1, type: 'auth', ts: Date.now(), data: authData }));
+  };
+  state.ws.onmessage = ev => { try { handleFrame(JSON.parse(ev.data)); } catch(e) {} };
   state.ws.onclose = () => {
-    const wasReady = state.ready;
-    state.ready = false;
     setStatus(false, '连接断开');
     state.syncing = false;
-    $('toggle-setup').style.display = '';
-    if (!wasReady) {
-      // 未收到 ready 即关闭：浏览器读不到 WS 握手的 HTTP 状态码，
-      // 此时只能是密钥无效或服务器不可达，明确提示并回到配置面板。
-      $('setup').style.display = 'flex';
-      alert('连接失败：密钥无效或服务器不可达\n请检查「服务器地址」与「密钥」是否正确');
+    if (authSent && state.role) {
+      // 鉴权成功后断开 → 回到设置面板但不清除凭据（下次可 resume）
+      $('toggle-setup').style.display = '';
+      showSetup();
+    } else if (!authSent) {
+      showErr('连接失败：服务器不可达');
     }
   };
-  state.ws.onerror = () => setStatus(false, '连接失败');
-
-  saveCfg();
+  state.ws.onerror = () => setStatus(false, '连接错误');
 }
 
-function onReady() {
+function genDeviceID() {
+  // 浏览器端用 crypto.randomUUID() + 随机串兜底
+  try {
+    return crypto.randomUUID().replace(/-/g, '');
+  } catch {
+    return Math.random().toString(16).slice(2) + Date.now().toString(16);
+  }
+}
+
+function showSetup() {
+  $('setup').style.display = 'flex';
+  $('chat').style.display = 'none';
+}
+function showChat() {
   $('setup').style.display = 'none';
   $('chat').style.display = 'flex';
   $('toggle-setup').style.display = '';
-  updateStatus();
-  // 用「本地游标」补拉历史：localSeq 只统计当前页面已渲染的消息，
-  // 刷新后为 0 → 全量重拉；同一页面内断线重连 → 仅补拉增量。
-  // 绝不能用 ready.last_seq 覆盖本地游标。
-  loadHistory();
 }
+function showErr(msg) { $('err-msg').textContent = msg || ''; }
 
 function loadHistory() {
-  if (state.syncing) return;
+  if (state.syncing || !state.ws) return;
   state.syncing = true;
   sendFrame({ v: 1, type: 'sync', data: { after: state.localSeq, limit: 200 } });
 }
-
 function sendFrame(f) {
   if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(f));
 }
@@ -282,20 +320,30 @@ function sendFrame(f) {
 // ---- 帧处理 ----
 function handleFrame(f) {
   switch (f.type) {
-    case 'ready': {
-      const d = f.data;
-      state.ready = true;
-      state.you = d.you;
-      state.peer = d.peer;
+    case 'auth.result': {
+      const d = f.data || {};
+      if (!d.success) {
+        setStatus(false, '鉴权失败');
+        showErr(d.error || '鉴权失败');
+        clearSavedAuth();
+        return;
+      }
+      state.role = d.role;
+      state.peer = state.role === 'A' ? 'B' : 'A';
+      state.token = d.token;
+      state.deviceID = d.device_id || state.deviceID;
       state.peerOnline = !!d.peer_online;
-      state.serverSeq = d.last_seq || 0; // 服务端游标，仅记录，不覆盖本地游标
-      onReady();
+      // 服务端 last_seq 仅记录，不覆盖本地游标
+      showErr('');
+      showChat();
+      updateStatus();
+      saveCfg();
+      loadHistory();
       break;
     }
     case 'msg.new': {
       const m = f.data;
       receiveMessage(m);
-      // 无论是否重复都回 ack（幂等）
       sendFrame({ v: 1, type: 'msg.ack', data: { seq: m.seq } });
       break;
     }
@@ -303,7 +351,7 @@ function handleFrame(f) {
       state.syncing = false;
       const d = f.data || {};
       for (const m of (d.msgs || [])) receiveMessage(m);
-      if (d.has_more) loadHistory(); // 继续下一页
+      if (d.has_more) loadHistory();
       break;
     }
     case 'presence': {
@@ -315,51 +363,44 @@ function handleFrame(f) {
       break;
     }
     case 'msg.ack': {
-      // 回填乐观气泡的真实 seq
       const d = f.data || {};
       if (d.ref) {
         const el = state.pending.get(d.ref);
-        if (el) {
-          if (d.seq) {
-            el.dataset.seq = d.seq;
-            const meta = el.querySelector('.meta');
-            if (meta) meta.textContent = meta.textContent.replace('#…', '#' + d.seq);
-            markSeq(d.seq);
-          }
+        if (el && d.seq) {
+          el.dataset.seq = d.seq;
+          const meta = el.querySelector('.meta');
+          if (meta) meta.textContent = meta.textContent.replace('#…', '#' + d.seq);
+          markSeq(d.seq);
           state.pending.delete(d.ref);
         }
       }
       break;
     }
-    case 'msg.delivered':
-      break; // UI 简化：不单独渲染回执
-    case 'pong':
-      break;
+    case 'msg.delivered': break;
+    case 'pong': break;
+    case 'ping': sendFrame({ v: 1, type: 'pong' }); break;
     case 'error': {
       const d = f.data || {};
       if (d.ref && state.pending.has(d.ref)) {
-        // 服务端拒绝的消息：撤回乐观气泡，避免「界面显示已发送」的误解
         state.pending.get(d.ref).remove();
         state.pending.delete(d.ref);
-        alert('发送失败: ' + (d.message || '未知错误'));
-        return;
       }
       console.error('服务端错误', d);
-      alert('服务端错误 ' + d.code + ': ' + d.message);
+      showErr('服务端错误 ' + d.code + ': ' + d.message);
       break;
     }
   }
 }
 
 // ---- 发送 ----
-async function sendText() {
+function sendText() {
   const text = $('input').value.trim();
   if (!text || !state.ws) return;
   $('input').value = '';
   const ref = 's' + Date.now() + Math.random().toString(36).slice(2, 6);
-  const el = bubble({ kind: 'text', body: text, ts: Date.now(), seq: '…', from: state.you }, true);
+  const el = bubble({ kind: 'text', body: text, ts: Date.now(), seq: '…', from: state.role }, true);
   state.pending.set(ref, el);
-  append(el); // 乐观渲染，收到 msg.ack 后回填 seq
+  append(el);
   sendFrame({ v: 1, type: 'msg.send', id: ref, data: { kind: 'text', body: text } });
 }
 
@@ -376,7 +417,7 @@ async function sendImage(file) {
     if (!resp.ok) throw new Error('上传失败 http=' + resp.status);
     const d = await resp.json();
     const ref = 'i' + Date.now() + Math.random().toString(36).slice(2, 6);
-    const el = bubble({ kind: 'image', file_id: d.file_id, size: d.size, ts: Date.now(), seq: '…', from: state.you }, true);
+    const el = bubble({ kind: 'image', file_id: d.file_id, size: d.size, ts: Date.now(), seq: '…', from: state.role }, true);
     state.pending.set(ref, el);
     append(el);
     sendFrame({
@@ -384,30 +425,35 @@ async function sendImage(file) {
       data: { kind: 'image', file_id: d.file_id, size: d.size }
     });
   } catch (e) {
-    alert(e.message || '图片上传失败');
+    showErr(e.message || '图片上传失败');
   }
 }
 
 // ---- 事件绑定 ----
-$('connect').onclick = connect;
+$('btn-init').onclick = () => connect('init');
+$('btn-login').onclick = () => connect('login');
 $('send').onclick = sendText;
 $('input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
 });
 $('img-btn').onclick = () => $('pick').click();
 $('pick').onchange = e => { if (e.target.files[0]) sendImage(e.target.files[0]); e.target.value = ''; };
-$('toggle-setup').onclick = () => {
-  const s = $('setup');
-  s.style.display = s.style.display === 'none' ? 'flex' : 'none';
-};
+$('toggle-setup').onclick = () => showSetup();
 
-// 初始化填充历史配置
+// 初始化：恢复历史配置 / 自动 resume
 (function init() {
   const cfg = loadCfg();
   if (cfg.addr) $('addr').value = cfg.addr;
-  if (cfg.token) $('token').value = cfg.token;
   if (!cfg.addr) {
     $('addr').value = location.origin.startsWith('http') ? location.origin : 'http://' + location.host;
+  }
+  // 如果上次保存了 token + device_id，自动 resume
+  if (cfg.token && cfg.deviceID && cfg.role) {
+    state.deviceID = cfg.deviceID;
+    state.token = cfg.token;
+    state.role = cfg.role;
+    state.peer = cfg.peer;
+    setTimeout(() => connect('resume'), 300);
   }
 })();
 

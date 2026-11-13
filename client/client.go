@@ -1,504 +1,606 @@
-// Package client 是 Fish 协议 v1 的平台无关适配库（自包含，仅依赖 WebSocket 实现）。
-//
-// 任何 Go 宿主（桌面端、agent、手机端经 gomobile）可直接复用；
-// 其他语言按 proto/PROTOCOL.md 实现同等能力即可。
+// Package client Fish 客户端 SDK，供手机端 / Windows 端 / CLI agent 端复用。
+// 基于帧内 auth 握手协议（init / login / resume）。
 package client
 
 import (
-	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"fish/internal/hub"
 )
 
-// Frame 协议信封，与 proto/PROTOCOL.md §3 一致。
-type Frame struct {
-	V    int             `json:"v"`
-	Type string          `json:"type"`
-	ID   string          `json:"id,omitempty"`
-	TS   int64           `json:"ts,omitempty"`
-	Data json.RawMessage `json:"data,omitempty"`
-}
-
-// Message 收到的消息载荷（msg.new / sync 条目）。
-type Message struct {
-	Seq    int64  `json:"seq"`
-	From   string `json:"from"`
-	Kind   string `json:"kind"`
-	Body   string `json:"body,omitempty"`
-	FileID string `json:"file_id,omitempty"`
-	W      int    `json:"w,omitempty"`
-	H      int    `json:"h,omitempty"`
-	Size   int64  `json:"size,omitempty"`
-	TS     int64  `json:"ts"`
-}
-
-// ReadyInfo ready 帧载荷。
-type ReadyInfo struct {
-	You        string `json:"you"`
-	Peer       string `json:"peer"`
-	PeerOnline bool   `json:"peer_online"`
-	LastSeq    int64  `json:"last_seq"`
-}
-
-// EventType 事件种类。
+// EventType 事件类型。
 type EventType string
 
 const (
-	EventReady     EventType = "ready"     // 连接就绪
-	EventMessage   EventType = "message"   // 收到新消息（含实时与补投）
-	EventDelivered EventType = "delivered" // 我发的消息被对端确认
-	EventPresence  EventType = "presence"  // 对端在线状态变化
-	EventError     EventType = "error"     // 服务端 error 帧
-	EventClosed    EventType = "closed"    // 连接断开
+	EventReady     EventType = "ready"     // auth 成功，收到首帧（含 role、peer_online、last_seq）
+	EventMessage   EventType = "message"   // 收到 msg.new
+	EventDelivered EventType = "delivered" // 对端已 ack 我方消息
+	EventPresence  EventType = "presence"  // 对端在线状态变更
+	EventError     EventType = "error"     // 服务端主动推送 error 帧
+	EventClosed    EventType = "closed"    // WS 连接断开
 )
 
+// Event 上层事件。
 type Event struct {
 	Type    EventType
 	Ready   *ReadyInfo
 	Message *Message
-	Seq     int64  // delivered 的 seq
-	Peer    string // presence 的对端身份
-	Online  bool   // presence 的在线状态
-	Code    int    // error 码
+	Seq     int64 // delivered / presence? 不适用
+	Peer    string
+	Online  bool
+	Code    int
 	Text    string
 }
 
+// ReadyInfo 鉴权成功后首帧信息。
+type ReadyInfo struct {
+	Role        string // "A" / "B"
+	Peer        string
+	DeviceID    string
+	Token       string
+	PeerOnline  bool
+	LastSeq     int64 // 服务端当前最大 seq
+}
+
+// Message 消息载荷（同步/实时同构）。
+type Message struct {
+	Seq    int64  `json:"seq"`
+	From   string `json:"from"`
+	Kind   string `json:"kind"`
+	Body   string `json:"body"`
+	FileID string `json:"file_id,omitempty"`
+	W      int    `json:"w,omitempty"`
+	H      int    `json:"h,omitempty"`
+	Size   int    `json:"size,omitempty"`
+	TS     int64  `json:"ts"`
+}
+
+// SyncResult 增量拉取结果。
+type SyncResult struct {
+	Msgs    []Message `json:"msgs"`
+	HasMore bool      `json:"has_more"`
+}
+
+// Client SDK 主结构。非线程安全：Send/Sync/Upload 之间可并发，
+// 但 Connect/Close 必须在其它调用之前/之后。
+type Client struct {
+	server    string   // http(s)://host:port
+	deviceID  string
+	token     string   // JWT，auth 成功后填入
+	role      string   // "A" / "B"
+	lastSeq   int64    // 本地已收游标（服务端历史位置）
+	cb        func(Event)
+	ws        *websocket.Conn
+	closed    bool
+	closeOnce sync.Once
+	mu        sync.Mutex
+	httpCli   *http.Client
+}
+
+// New 构造一个未连接的 Client。server 不带末尾 /。
+func New(server string, cb func(Event)) *Client {
+	return &Client{
+		server:  strings.TrimRight(server, "/"),
+		cb:      cb,
+		httpCli: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// ---------- Connect ----------
+
+// ConnectAction 鉴权动作。
+type ConnectAction string
+
 const (
-	pingInterval  = 30 * time.Second
-	replyTimeout  = 10 * time.Second
-	syncChunkSize = 200
+	ActionInit  ConnectAction = "init"
+	ActionLogin ConnectAction = "login"
+	ActionResume ConnectAction = "resume"
 )
 
-// Client 单端协议适配器。一个实例对应一个固定身份（token 决定）。
-type Client struct {
-	serverURL string // 如 http://host:8080
-	token     string
-
-	// AutoAck 收到 msg.new 后是否自动回 msg.ack（默认 true）
-	AutoAck bool
-
-	ws      *websocket.Conn
-	wsMu    sync.Mutex
-	events  chan Event
-	pending sync.Map // ref -> chan Frame
-	lastSeq int64    // 本地已收到的最大 seq（本地游标，用于 sync.after）
-	serverSeq int64  // 服务端最新 seq（仅用于判断是否落后，不可当本地游标）
-	seqMu   sync.Mutex
-	refSeq  atomic.Int64
-	closed  chan struct{}
-	closed1 sync.Once
-	http    *http.Client
+// ConnectOptions 连接参数。deviceID 为空时自动生成；token 留空时 Resume 会自动用已有值。
+type ConnectOptions struct {
+	DeviceID    string
+	Password    string
+	Action      ConnectAction // init / login / resume
+	DesiredRole string        // 留空自动分配；A、B 都存在时 login 必填
+	Token       string        // resume 专用，优先级高于 Client.token
 }
 
-func New(serverURL, token string) *Client {
-	return &Client{
-		serverURL: strings.TrimRight(serverURL, "/"),
-		token:     token,
-		AutoAck:   true,
-		events:    make(chan Event, 64),
-		closed:    make(chan struct{}),
-		http:      &http.Client{Timeout: 60 * time.Second},
+// Connect 建立 WS + auth 握手。成功后阻塞直到 Close 被调用。
+// 内部逻辑：HTTP → WS 升级 → 发送 auth 帧 → 校验 auth.result 成功 → 进入 Hub.Run 循环（
+// 在 SDK 这里就是 readLoop）。
+func (c *Client) Connect(opts ConnectOptions) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if opts.Action == "" {
+		return errors.New("必须指定 action：init / login / resume")
 	}
-}
-
-// Events 事件流。Connect 前调用即可，事件按序投递。
-func (c *Client) Events() <-chan Event { return c.events }
-
-// LastSeq 本地已见最大 seq（本地游标，用于断线后 sync.after 增量补投）。
-// 注意：该值只随实际收到的消息推进，不会被 ready.last_seq 覆盖。
-func (c *Client) LastSeq() int64 {
-	c.seqMu.Lock()
-	defer c.seqMu.Unlock()
-	return c.lastSeq
-}
-
-// ServerSeq 服务端当前最大 seq（连接建立时由 ready 帧给出），
-// 仅用于判断本地是否落后，禁止用作 sync.after。
-func (c *Client) ServerSeq() int64 {
-	c.seqMu.Lock()
-	defer c.seqMu.Unlock()
-	return c.serverSeq
-}
-
-func (c *Client) setLastSeq(v int64) {
-	c.seqMu.Lock()
-	if v > c.lastSeq {
-		c.lastSeq = v
+	if opts.DeviceID != "" {
+		c.deviceID = opts.DeviceID
+	} else if c.deviceID == "" {
+		c.deviceID = RandDeviceID()
 	}
-	c.seqMu.Unlock()
-}
+	if opts.Action == ActionResume {
+		if opts.Token != "" {
+			c.token = opts.Token
+		}
+		if c.token == "" {
+			return errors.New("resume 需要 token")
+		}
+	}
 
-// Connect 建立 WS 连接并等待 ready 帧。
-func (c *Client) Connect() error {
-	wsURL := wsScheme(c.serverURL) + "/ws?token=" + c.token
-	ws, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	wsURL := "ws" + strings.TrimPrefix(c.server, "http") + "/ws"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		return fmt.Errorf("连接失败: %w (http=%v)", err, statusOf(resp))
+		return fmt.Errorf("WS dial: %w", err)
 	}
 	c.ws = ws
-	c.closed = make(chan struct{})
+	c.closed = false
 
-	var f Frame
-	_ = ws.SetReadDeadline(time.Now().Add(replyTimeout))
+	// 发送 auth 帧
+	authData, _ := json.Marshal(map[string]any{
+		"device_id":    c.deviceID,
+		"action":       string(opts.Action),
+		"password":     opts.Password,
+		"desired_role": opts.DesiredRole,
+		"token":        c.token,
+	})
+	_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := ws.WriteJSON(hub.Frame{V: 1, Type: "auth", TS: time.Now().UnixMilli(), Data: authData}); err != nil {
+		ws.Close()
+		return fmt.Errorf("发送 auth: %w", err)
+	}
+	_ = ws.SetWriteDeadline(time.Time{})
+
+	_ = ws.SetReadDeadline(time.Now().Add(30 * time.Second))
+	var f hub.Frame
 	if err := ws.ReadJSON(&f); err != nil {
-		return fmt.Errorf("等待 ready 失败: %w", err)
+		ws.Close()
+		return fmt.Errorf("读 auth.result: %w", err)
 	}
-	if f.Type != "ready" {
-		return fmt.Errorf("首帧类型异常: %s", f.Type)
+	_ = ws.SetReadDeadline(time.Time{})
+	if f.Type != "auth.result" {
+		ws.Close()
+		return fmt.Errorf("首帧应为 auth.result, got %s", f.Type)
 	}
-	_ = ws.SetReadDeadline(time.Time{}) // 清除 ready 等待超时，恢复长连接读
-	var ri ReadyInfo
-	_ = json.Unmarshal(f.Data, &ri)
-	// ready.last_seq 是服务端游标，不是本地游标；仅记录，绝不覆盖 lastSeq
-	c.seqMu.Lock()
-	c.serverSeq = ri.LastSeq
-	c.seqMu.Unlock()
-	c.emit(Event{Type: EventReady, Ready: &ri})
+	var res authResult
+	if err := json.Unmarshal(f.Data, &res); err != nil {
+		ws.Close()
+		return fmt.Errorf("auth.result 解析: %w", err)
+	}
+	if !res.Success {
+		ws.Close()
+		return errors.New(res.Error)
+	}
 
+	c.role = res.Role
+	if res.DeviceID != "" {
+		c.deviceID = res.DeviceID
+	}
+	c.token = res.Token
+
+	// 分发 Ready 事件
+	c.emit(Event{
+		Type: EventReady,
+		Ready: &ReadyInfo{
+			Role:       res.Role,
+			Peer:       peerOf(res.Role),
+			DeviceID:   c.deviceID,
+			Token:      res.Token,
+			PeerOnline: res.PeerOnline,
+			LastSeq:    res.LastSeq,
+		},
+	})
+
+	// 启动读循环
 	go c.readLoop(ws)
-	go c.heartbeat()
+
 	return nil
 }
 
+// Close 关闭连接。可重入。
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		c.closed = true
+		if c.ws != nil {
+			_ = c.ws.Close()
+		}
+		c.emit(Event{Type: EventClosed})
+	})
+}
+
+// ---------- SendText / SendImage ----------
+
+// SendText 发送文本。返回服务端分配的 seq（>0）。
+func (c *Client) SendText(body string) (int64, error) {
+	if !c.Connected() {
+		return 0, errors.New("未连接")
+	}
+	d, _ := json.Marshal(map[string]any{"kind": "text", "body": body})
+	id := "ref-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	_ = c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := c.ws.WriteJSON(hub.Frame{V: 1, Type: "msg.send", ID: id, TS: time.Now().UnixMilli(), Data: d}); err != nil {
+		return 0, err
+	}
+	_ = c.ws.SetWriteDeadline(time.Time{})
+	// 同步等 msg.ack
+	ack, err := c.waitForAck(id)
+	if err != nil {
+		return 0, err
+	}
+	return ack, nil
+}
+
+// UploadImage HTTP 上传图片，返回 file_id。
+func (c *Client) UploadImage(filename string, data []byte) (fileID string, size int, err error) {
+	if c.token == "" {
+		return "", 0, errors.New("未鉴权，无 token")
+	}
+	u := c.server + "/api/files"
+	body := &multipartBody{data: data, filename: filename}
+	req, _ := http.NewRequest("POST", u, body)
+	req.Header.Set("Content-Type", body.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.httpCli.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, fmt.Errorf("上传失败 %d: %s", resp.StatusCode, raw)
+	}
+	var res struct {
+		FileID string `json:"file_id"`
+		Size   int    `json:"size"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return "", 0, err
+	}
+	return res.FileID, res.Size, nil
+}
+
+// SendImage 先 UploadImage 再发 msg.send。
+func (c *Client) SendImage(filename string, data []byte, w, h int) (int64, error) {
+	fileID, size, err := c.UploadImage(filename, data)
+	if err != nil {
+		return 0, err
+	}
+	d, _ := json.Marshal(map[string]any{
+		"kind": "image", "file_id": fileID, "w": w, "h": h, "size": size,
+	})
+	id := "ref-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	_ = c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := c.ws.WriteJSON(hub.Frame{V: 1, Type: "msg.send", ID: id, TS: time.Now().UnixMilli(), Data: d}); err != nil {
+		return 0, err
+	}
+	_ = c.ws.SetWriteDeadline(time.Time{})
+	ack, err := c.waitForAck(id)
+	if err != nil {
+		return 0, err
+	}
+	return ack, nil
+}
+
+// DownloadImage 按 file_id 下载字节。
+func (c *Client) DownloadImage(fileID string) ([]byte, error) {
+	if c.token == "" {
+		return nil, errors.New("未鉴权")
+	}
+	u := c.server + "/api/files/" + url.PathEscape(fileID) + "?token=" + c.token
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.httpCli.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("下载失败 %d", resp.StatusCode)
+	}
+	return raw, nil
+}
+
+// Sync 增量拉取 seq > after 的消息。limit 最大 200。hasMore 为 true 时继续拉。
+func (c *Client) Sync(after int64, limit int) (*SyncResult, error) {
+	if !c.Connected() {
+		return nil, errors.New("未连接")
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	d, _ := json.Marshal(map[string]any{"after": after, "limit": limit})
+	reqID := "sync-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	_ = c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := c.ws.WriteJSON(hub.Frame{V: 1, Type: "sync", ID: reqID, TS: time.Now().UnixMilli(), Data: d}); err != nil {
+		return nil, err
+	}
+	_ = c.ws.SetWriteDeadline(time.Time{})
+	return c.waitForSync(reqID)
+}
+
+// ---------- 只读访问器 ----------
+
+func (c *Client) Role() string    { return c.role }
+func (c *Client) DeviceID() string { return c.deviceID }
+func (c *Client) Token() string   { return c.token }
+func (c *Client) Server() string  { return c.server }
+func (c *Client) Connected() bool { return c.ws != nil && !c.closed }
+
+// ---------- readLoop ----------
+
 func (c *Client) readLoop(ws *websocket.Conn) {
+	defer func() {
+		c.closeOnce.Do(func() {
+			c.closed = true
+			c.emit(Event{Type: EventClosed})
+		})
+	}()
 	for {
-		var f Frame
+		var f hub.Frame
+		_ = ws.SetReadDeadline(time.Time{})
 		if err := ws.ReadJSON(&f); err != nil {
-			c.emit(Event{Type: EventClosed, Text: err.Error()})
-			c.shutdown()
 			return
 		}
 		c.handleFrame(f)
 	}
 }
 
-func (c *Client) handleFrame(f Frame) {
+func (c *Client) handleFrame(f hub.Frame) {
 	switch f.Type {
 	case "msg.new":
 		var m Message
-		if json.Unmarshal(f.Data, &m) != nil {
+		if err := json.Unmarshal(f.Data, &m); err != nil {
 			return
 		}
-		// seq 幂等去重
-		if m.Seq <= c.LastSeq() {
-			return
+		if m.Seq > c.lastSeq {
+			c.lastSeq = m.Seq
 		}
-		c.setLastSeq(m.Seq)
+		// 自动回 ack（幂等）
+		ackD, _ := json.Marshal(map[string]any{"seq": m.Seq})
+		_ = c.ws.WriteJSON(hub.Frame{V: 1, Type: "msg.ack", Data: ackD})
 		c.emit(Event{Type: EventMessage, Message: &m})
-		if c.AutoAck {
-			_ = c.write(Frame{V: 1, Type: "msg.ack", Data: mustJSON(map[string]int64{"seq": m.Seq})})
-		}
-	case "msg.delivered":
+
+	case "msg.ack":
 		var d struct {
-			Seq int64 `json:"seq"`
+			Ref string `json:"ref"`
+			Seq int64  `json:"seq"`
 		}
-		if json.Unmarshal(f.Data, &d) == nil {
-			c.emit(Event{Type: EventDelivered, Seq: d.Seq})
+		if err := json.Unmarshal(f.Data, &d); err != nil {
+			return
 		}
+		// 让 SendText 等的 waitForAck 能返回
+		c.resolvePendingAck(d.Ref, d.Seq, nil)
+
+	case "msg.delivered":
+		var d struct{ Seq int64 }
+		if err := json.Unmarshal(f.Data, &d); err != nil {
+			return
+		}
+		c.emit(Event{Type: EventDelivered, Seq: d.Seq})
+
 	case "presence":
 		var d struct {
 			Peer   string `json:"peer"`
 			Online bool   `json:"online"`
 		}
-		if json.Unmarshal(f.Data, &d) == nil {
-			c.emit(Event{Type: EventPresence, Peer: d.Peer, Online: d.Online})
+		if err := json.Unmarshal(f.Data, &d); err != nil {
+			return
 		}
+		c.emit(Event{Type: EventPresence, Peer: d.Peer, Online: d.Online})
+
 	case "error":
-		var e struct {
+		var d struct {
 			Code    int    `json:"code"`
 			Message string `json:"message"`
 			Ref     string `json:"ref"`
 		}
-		if json.Unmarshal(f.Data, &e) != nil {
+		if err := json.Unmarshal(f.Data, &d); err != nil {
 			return
 		}
-		if e.Ref != "" {
-			if ch, ok := c.pending.LoadAndDelete(e.Ref); ok {
-				ch.(chan Frame) <- f
-				return
-			}
-		}
-		c.emit(Event{Type: EventError, Code: e.Code, Text: e.Message})
-	default:
-		// msg.ack / sync.done / pong 等请求-响应帧，交给 pending
-		if f.ID != "" {
-			if ch, ok := c.pending.Load(f.ID); ok {
-				select {
-				case ch.(chan Frame) <- f:
-				default:
-				}
-			}
-		}
-	}
-}
+		c.resolvePendingAck(d.Ref, 0, errors.New(d.Message))
+		c.emit(Event{Type: EventError, Code: d.Code, Text: d.Message})
 
-func (c *Client) heartbeat() {
-	t := time.NewTicker(pingInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			_ = c.write(Frame{V: 1, Type: "ping"})
-		case <-c.closed:
-			return
-		}
-	}
-}
-
-func (c *Client) write(f Frame) error {
-	c.wsMu.Lock()
-	defer c.wsMu.Unlock()
-	if c.ws == nil {
-		return fmt.Errorf("未连接")
-	}
-	return c.ws.WriteJSON(f)
-}
-
-// call 发送请求帧并等待对应响应（按 ID 关联）。
-func (c *Client) call(f Frame, timeout time.Duration) (Frame, error) {
-	ref := fmt.Sprintf("c%d-%d", time.Now().UnixNano(), c.refSeq.Add(1))
-	f.ID = ref
-	ch := make(chan Frame, 1)
-	c.pending.Store(ref, ch)
-	defer c.pending.Delete(ref)
-
-	if err := c.write(f); err != nil {
-		return Frame{}, err
-	}
-	select {
-	case resp := <-ch:
-		return resp, nil
-	case <-time.After(timeout):
-		return Frame{}, fmt.Errorf("等待 %s 响应超时", f.Type)
-	case <-c.closed:
-		return Frame{}, fmt.Errorf("连接已断开")
-	}
-}
-
-// SendText 发送文本消息，返回服务端分配的 seq。
-func (c *Client) SendText(body string) (int64, error) {
-	resp, err := c.call(Frame{V: 1, Type: "msg.send",
-		Data: mustJSON(map[string]string{"kind": "text", "body": body})}, replyTimeout)
-	if err != nil {
-		return 0, err
-	}
-	if resp.Type == "error" {
-		return 0, decodeError(resp)
-	}
-	var d struct {
-		Seq int64 `json:"seq"`
-	}
-	if json.Unmarshal(resp.Data, &d) != nil || d.Seq <= 0 {
-		return 0, fmt.Errorf("msg.ack 响应异常")
-	}
-	c.setLastSeq(d.Seq)
-	return d.Seq, nil
-}
-
-// UploadImage 上传图片字节，返回 file_id。
-func (c *Client) UploadImage(data []byte, filename string) (string, error) {
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	fw, err := mw.CreateFormFile("file", filename)
-	if err != nil {
-		return "", err
-	}
-	if _, err := fw.Write(data); err != nil {
-		return "", err
-	}
-	if err := mw.Close(); err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequest("POST", c.serverURL+"/api/files", &buf)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+c.token)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("上传失败 http=%d: %s", resp.StatusCode, truncate(body, 200))
-	}
-	var d struct {
-		FileID string `json:"file_id"`
-	}
-	if json.Unmarshal(body, &d) != nil || d.FileID == "" {
-		return "", fmt.Errorf("上传响应异常")
-	}
-	return d.FileID, nil
-}
-
-// SendImage 发送图片消息（file_id 需先经 UploadImage 获得）。
-func (c *Client) SendImage(fileID string, w, h int, size int64) (int64, error) {
-	resp, err := c.call(Frame{V: 1, Type: "msg.send",
-		Data: mustJSON(map[string]any{"kind": "image", "file_id": fileID, "w": w, "h": h, "size": size})}, replyTimeout)
-	if err != nil {
-		return 0, err
-	}
-	if resp.Type == "error" {
-		return 0, decodeError(resp)
-	}
-	var d struct {
-		Seq int64 `json:"seq"`
-	}
-	if json.Unmarshal(resp.Data, &d) != nil || d.Seq <= 0 {
-		return 0, fmt.Errorf("msg.ack 响应异常")
-	}
-	c.setLastSeq(d.Seq)
-	return d.Seq, nil
-}
-
-// SyncResult 增量拉取结果。
-type SyncResult struct {
-	Msgs    []Message
-	HasMore bool
-}
-
-// Sync 拉取 seq > after 的历史消息（内部自动翻页至拉完或 limit 上限）。
-func (c *Client) Sync(after int64, limit int) (*SyncResult, error) {
-	if limit <= 0 || limit > syncChunkSize {
-		limit = syncChunkSize
-	}
-	out := &SyncResult{}
-	for len(out.Msgs) < limit {
-		resp, err := c.call(Frame{V: 1, Type: "sync",
-			Data: mustJSON(map[string]int64{"after": after, "limit": syncChunkSize})}, replyTimeout)
-		if err != nil {
-			return nil, err
-		}
-		if resp.Type == "error" {
-			return nil, decodeError(resp)
-		}
+	case "sync.done":
 		var d struct {
 			Msgs    []Message `json:"msgs"`
 			HasMore bool      `json:"has_more"`
 		}
-		if json.Unmarshal(resp.Data, &d) != nil {
-			return nil, fmt.Errorf("sync.done 响应异常")
+		if err := json.Unmarshal(f.Data, &d); err != nil {
+			return
 		}
-		out.Msgs = append(out.Msgs, d.Msgs...)
-		out.HasMore = d.HasMore
-		if len(d.Msgs) == 0 {
-			break
+		// 更新游标
+		for _, m := range d.Msgs {
+			if m.Seq > c.lastSeq {
+				c.lastSeq = m.Seq
+			}
 		}
-		after = d.Msgs[len(d.Msgs)-1].Seq
-		if !d.HasMore {
-			break
+		// 唤醒 waitForSync
+		if f.ID != "" {
+			if v, ok := pendingSync.Load(f.ID); ok {
+				ch := v.(chan *SyncResult)
+				select {
+				case ch <- &SyncResult{Msgs: d.Msgs, HasMore: d.HasMore}:
+				default:
+				}
+				pendingSync.Delete(f.ID)
+			}
 		}
+
+	case "pong":
+		// 忽略
+
+	case "ping":
+		// 服务端可能主动 ping 保活；回 pong
+		_ = c.ws.WriteJSON(hub.Frame{V: 1, Type: "pong"})
 	}
-	if len(out.Msgs) > limit {
-		out.Msgs = out.Msgs[:limit]
-	}
-	for _, m := range out.Msgs {
-		c.setLastSeq(m.Seq)
-	}
-	return out, nil
 }
 
-// DownloadImage 下载图片字节。
-func (c *Client) DownloadImage(fileID string) ([]byte, error) {
-	req, _ := http.NewRequest("GET", c.serverURL+"/api/files/"+fileID, nil)
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("下载失败 http=%d", resp.StatusCode)
-	}
-	return io.ReadAll(resp.Body)
+// ---------- ack / sync 等待机制 ----------
+
+type ackWaiter struct {
+	ch  chan ackResult
+	ref string
+}
+type ackResult struct {
+	Seq int64
+	Err error
 }
 
-// ImageURL 供 UI 直接引用的下载地址（带 token 查询参数）。
-func (c *Client) ImageURL(fileID string) string {
-	return c.serverURL + "/api/files/" + fileID + "?token=" + c.token
+var pendingAck = sync.Map{} // ref → *ackWaiter
+
+func (c *Client) waitForAck(ref string) (int64, error) {
+	ch := make(chan ackResult, 1)
+	entry := &ackWaiter{ch: ch, ref: ref}
+	pendingAck.Store(ref, entry)
+	defer pendingAck.Delete(ref)
+
+	select {
+	case r := <-ch:
+		return r.Seq, r.Err
+	case <-time.After(15 * time.Second):
+		return 0, errors.New("等待 msg.ack 超时")
+	}
 }
+
+func (c *Client) resolvePendingAck(ref string, seq int64, err error) {
+	if ref == "" {
+		return
+	}
+	v, ok := pendingAck.Load(ref)
+	if !ok {
+		return
+	}
+	entry := v.(*ackWaiter)
+	select {
+	case entry.ch <- ackResult{Seq: seq, Err: err}:
+	default:
+	}
+}
+
+var pendingSync = sync.Map{} // id → chan *SyncResult
+
+func (c *Client) waitForSync(id string) (*SyncResult, error) {
+	ch := make(chan *SyncResult, 1)
+	pendingSync.Store(id, ch)
+	defer pendingSync.Delete(id)
+
+	// 复用 readLoop——但我们需要在 readLoop 里也处理 sync.done 帧
+	// 最简单：让 readLoop 也 resolve pendingSync
+	// 所以我们把这段放在 handleFrame 里处理。这里只是等。
+	select {
+	case r := <-ch:
+		return r, nil
+	case <-time.After(30 * time.Second):
+		return nil, errors.New("等待 sync.done 超时")
+	}
+}
+
+// ---------- emit ----------
 
 func (c *Client) emit(e Event) {
-	select {
-	case c.events <- e:
-	default: // 事件队列满时丢弃最旧的事件，防止阻塞读循环
-		select {
-		case <-c.events:
-		default:
-		}
-		select {
-		case c.events <- e:
-		default:
-		}
+	if c.cb != nil {
+		defer func() { _ = recover() }()
+		c.cb(e)
 	}
 }
 
-func (c *Client) shutdown() {
-	c.closed1.Do(func() { close(c.closed) })
+// ---------- helpers ----------
+
+type authResult struct {
+	Success    bool   `json:"success"`
+	Error      string `json:"error"`
+	Role       string `json:"role"`
+	DeviceID   string `json:"device_id"`
+	Token      string `json:"token"`
+	PeerOnline bool   `json:"peer_online"`
+	LastSeq    int64  `json:"last_seq"`
 }
 
-// Close 断开连接。
-func (c *Client) Close() error {
-	c.shutdown()
-	c.wsMu.Lock()
-	ws := c.ws
-	c.ws = nil
-	c.wsMu.Unlock()
-	if ws != nil {
-		return ws.Close()
+func peerOf(role string) string {
+	switch role {
+	case "A":
+		return "B"
+	case "B":
+		return "A"
 	}
-	return nil
+	return ""
 }
 
-// ---- helpers ----
-
-func mustJSON(v any) json.RawMessage {
-	b, _ := json.Marshal(v)
-	return b
+// RandDeviceID 生成 16 字节随机 hex 字符串，用作首次连接的设备标识。
+func RandDeviceID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
-func decodeError(f Frame) error {
-	var e struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	}
-	_ = json.Unmarshal(f.Data, &e)
-	return fmt.Errorf("服务端错误 %d: %s", e.Code, e.Message)
+// multipartBody 简易 multipart.Part 包装，满足 http.Request.Body。
+type multipartBody struct {
+	data        []byte
+	filename    string
+	boundary    string
+	headerBuilt bool
+	head        []byte
+	foot        []byte
+	r           int
 }
 
-func wsScheme(u string) string {
-	if strings.HasPrefix(u, "https://") {
-		return "wss://" + strings.TrimPrefix(u, "https://")
+func (m *multipartBody) FormDataContentType() string {
+	if m.boundary == "" {
+		m.boundary = hex.EncodeToString(make([]byte, 16))
 	}
-	if strings.HasPrefix(u, "ws://") {
-		return u
-	}
-	return "ws://" + strings.TrimPrefix(u, "http://")
+	return "multipart/form-data; boundary=" + m.boundary
 }
 
-func statusOf(resp *http.Response) int {
-	if resp == nil {
-		return 0
+func (m *multipartBody) buildOnce() {
+	if m.headerBuilt {
+		return
 	}
-	return resp.StatusCode
+	m.headerBuilt = true
+	if m.boundary == "" {
+		m.boundary = hex.EncodeToString(make([]byte, 16))
+	}
+	m.head = []byte(fmt.Sprintf(
+		"--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+		m.boundary, m.filename))
+	m.foot = []byte("\r\n--" + m.boundary + "--\r\n")
 }
 
-func truncate(b []byte, n int) string {
-	if len(b) <= n {
-		return string(b)
+func (m *multipartBody) Read(p []byte) (int, error) {
+	m.buildOnce()
+	total := len(m.head) + len(m.data) + len(m.foot)
+	if m.r >= total {
+		return 0, io.EOF
 	}
-	return string(b[:n]) + "..."
+	var n int
+	if m.r < len(m.head) {
+		n = copy(p, m.head[m.r:])
+		m.r += n
+		return n, nil
+	}
+	if m.r < len(m.head)+len(m.data) {
+		idx := m.r - len(m.head)
+		n = copy(p, m.data[idx:])
+		m.r += n
+		return n, nil
+	}
+	idx := m.r - len(m.head) - len(m.data)
+	n = copy(p, m.foot[idx:])
+	m.r += n
+	return n, nil
 }

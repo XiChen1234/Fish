@@ -98,18 +98,19 @@ func (c *Config) validate() error {
 	if c.DataDir == "" {
 		c.DataDir = "./data"
 	}
-	if len(c.Endpoints) != 2 {
-		return fmt.Errorf("endpoints 必须恰好配置 2 个固定身份，当前 %d 个", len(c.Endpoints))
-	}
-	seen := map[string]bool{}
-	for _, ep := range c.Endpoints {
-		if ep.ID == "" || ep.Token == "" {
-			return fmt.Errorf("endpoint id/token 不能为空")
+	// endpoints 已在动态配对鉴权体系下弃用：允许为空数组。
+	// 兼容保留：不为空时只做格式校验，不强制数量。
+	if len(c.Endpoints) > 0 {
+		seen := map[string]bool{}
+		for _, ep := range c.Endpoints {
+			if ep.ID == "" || ep.Token == "" {
+				return fmt.Errorf("endpoint id/token 不能为空")
+			}
+			if seen[ep.ID] {
+				return fmt.Errorf("endpoint id 重复: %s", ep.ID)
+			}
+			seen[ep.ID] = true
 		}
-		if seen[ep.ID] {
-			return fmt.Errorf("endpoint id 重复: %s", ep.ID)
-		}
-		seen[ep.ID] = true
 	}
 	if c.MaxTextBytes <= 0 {
 		c.MaxTextBytes = DefaultMaxTextBytes
