@@ -39,22 +39,21 @@ jobs:
           script: |
             if [ ! -f /opt/fish/config.json ]; then
               echo "✗ /opt/fish/config.json 不存在"
-              echo "  请先在服务器上执行一次："
+              echo "  请先 SSH 到服务器执行："
               echo "    sudo mkdir -p /opt/fish"
               echo "    sudo tee /opt/fish/config.json <<'EOF'"
               echo '    {'
               echo '      "listen": ":19090",'
-              echo '      "data_dir": "./data",'
-              echo '      "endpoints": ['
-              echo '        { "id": "a", "token": "<你的token-a>" },'
-              echo '        { "id": "b", "token": "<你的token-b>" }'
-              echo '      ]'
+              echo '      "data_dir": "./data"'
               echo '    }'
               echo '    EOF'
               echo "    sudo chown fish:fish /opt/fish/config.json"
               exit 1
             fi
-            echo "✓ config.json 已就绪"
+            echo "✓ config.json 已就绪（$(stat -c%s /opt/fish/config.json) bytes）"
+            # 打印当前 config.json 内容供排查（不含敏感字段，endpoints 已弃用）
+            echo "--- 当前 config.json ---"
+            cat /opt/fish/config.json
 
       - name: Idempotent init + upload + restart
         uses: appleboy/ssh-action@v1.0.3
@@ -71,17 +70,17 @@ jobs:
             set -e
 
             # ---------- 1. 幂等初始化（第一次部署自动完成，后续幂等 no-op） ----------
-            # 创建运行用户
             if ! id -u fish &>/dev/null; then
               useradd --system --no-create-home --shell /usr/sbin/nologin fish
-              echo "+ 创建 fish 用户"
+              echo "+ 创建 fish 运行用户 (UID=$(id -u fish))"
             fi
-            # 部署目录
             mkdir -p /opt/fish
-            # systemd 服务单元（每次都覆盖，保证和仓库 deploy/fish.service 一致）
+            chown fish:fish /opt/fish
+
+            # systemd 服务单元（每次覆盖，保证与仓库版本一致）
             cat > /etc/systemd/system/fish.service <<'UNIT'
             [Unit]
-            Description=Fish private messaging server (single user, two endpoints)
+            Description=Fish private messaging server (single room, dynamic pairing)
             After=network-online.target
             Wants=network-online.target
 
@@ -106,14 +105,14 @@ jobs:
             systemctl daemon-reload
             echo "+ systemd 单元就绪"
 
-            # ---------- 2. 上传并原子替换 ----------
+            # ---------- 2. 原子替换 ----------
             if [ -f /opt/fish/fish-server ]; then
               cp -a /opt/fish/fish-server /opt/fish/fish-server.bak
             fi
             mv /opt/fish/fish-server.new /opt/fish/fish-server
             chmod 755 /opt/fish/fish-server
-            chown -R fish:fish /opt/fish
-            echo "+ 二进制已替换"
+            chown fish:fish /opt/fish/fish-server
+            echo "+ 二进制已替换（旧版本已备份为 fish-server.bak）"
 
             # ---------- 3. 启用开机自启 + 重启 ----------
             systemctl enable fish
@@ -122,15 +121,19 @@ jobs:
 
             if systemctl is-active fish >/dev/null 2>&1; then
               echo "✓ fish 启动成功"
-              systemctl --no-pager --full status fish | head -8
+              systemctl --no-pager --full status fish | head -10
+              echo "--- 健康检查 ---"
+              curl -fsS http://127.0.0.1:19090/healthz || echo "⚠ /healthz 不可达"
             else
-              echo "✗ fish 启动失败，回滚..."
+              echo "✗ fish 启动失败，自动回滚..."
               journalctl -u fish --no-pager -n 30 || true
               if [ -f /opt/fish/fish-server.bak ]; then
                 mv /opt/fish/fish-server.bak /opt/fish/fish-server
                 chmod 755 /opt/fish/fish-server
                 systemctl restart fish || true
-                echo "+ 已回滚到备份二进制"
+                if systemctl is-active fish >/dev/null 2>&1; then
+                  echo "✓ 回滚成功，旧二进制已启动"
+                fi
               fi
               exit 1
             fi
