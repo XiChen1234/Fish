@@ -7,7 +7,8 @@ on:
 
 concurrency:
   group: deploy
-  cancel-in-progress: true
+  # 部署串行执行：避免新推送取消正在进行的部署，留下半完成的 .new/回滚状态
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -54,7 +55,7 @@ jobs:
             set -e
 
             # ---------- 1. 幂等初始化（第一次部署自动完成，后续幂等 no-op） ----------
-            if ! id -u fish &>/dev/null; then
+            if ! id -u fish >/dev/null 2>&1; then
               useradd --system --no-create-home --shell /usr/sbin/nologin fish
               echo "+ 创建 fish 运行用户 (UID=$(id -u fish))"
             fi
