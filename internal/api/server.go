@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -25,11 +27,64 @@ type Server struct {
 	auth  *auth.Auth
 	hub   *hub.Hub
 	store *store.Store
+
+	// 登录失败限流（按来源 IP）
+	authMu    sync.Mutex
+	authFails map[string]*authFail
+}
+
+// 同一 IP 在窗口期内累计失败达到阈值后暂时拒绝鉴权，避免在线暴力破解密码。
+const (
+	maxAuthFails   = 10
+	authFailWindow = 5 * time.Minute
+)
+
+type authFail struct {
+	count int
+	until time.Time
 }
 
 func New(cfg *config.Config, a *auth.Auth, h *hub.Hub, st *store.Store) *Server {
 	h.PeerOf = auth.PeerOf
-	return &Server{cfg: cfg, auth: a, hub: h, store: st}
+	return &Server{cfg: cfg, auth: a, hub: h, store: st, authFails: make(map[string]*authFail)}
+}
+
+// authBlocked 判断来源 IP 是否因失败次数过多被暂时锁定。
+func (s *Server) authBlocked(ip string) bool {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	st, ok := s.authFails[ip]
+	if !ok {
+		return false
+	}
+	if time.Now().After(st.until) {
+		delete(s.authFails, ip)
+		return false
+	}
+	return st.count >= maxAuthFails
+}
+
+// noteAuth 记录鉴权结果：成功清零，失败累计。
+func (s *Server) noteAuth(ip string, ok bool) {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	if ok {
+		delete(s.authFails, ip)
+		return
+	}
+	st := s.authFails[ip]
+	if st == nil || time.Now().After(st.until) {
+		st = &authFail{until: time.Now().Add(authFailWindow)}
+		s.authFails[ip] = st
+	}
+	st.count++
+}
+
+func clientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 func (s *Server) Routes() http.Handler {
@@ -86,7 +141,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := clientIP(r)
+	if s.authBlocked(ip) {
+		s.writeAuthError(ws, "登录失败次数过多，请稍后再试")
+		return
+	}
+
 	role, deviceID, token, err := s.doAuth(f)
+	s.noteAuth(ip, err == nil)
 	if err != nil {
 		s.writeAuthError(ws, err.Error())
 		return

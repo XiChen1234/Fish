@@ -167,6 +167,30 @@ func TestWS_FrameVersionRejected(t *testing.T) {
 	}
 }
 
+// 连续鉴权失败达到阈值后应暂时拒绝该 IP（即使密码正确）。
+func TestWS_AuthRateLimited(t *testing.T) {
+	ts := newTestServer(t)
+	ws := dialWS(t, ts, "dev-a", "secret1234", "init", "")
+	ws.Close()
+
+	for i := 0; i < maxAuthFails; i++ {
+		w, res := dialWSFull(t, ts, "dev-b", "wrong-password", "login", "", "")
+		w.Close()
+		if res.Success {
+			t.Fatalf("第 %d 次坏密码不应成功", i+1)
+		}
+	}
+
+	w, res := dialWSFull(t, ts, "dev-b", "secret1234", "login", "", "")
+	w.Close()
+	if res.Success {
+		t.Fatal("失败超限后即使密码正确也应被拒绝")
+	}
+	if !strings.Contains(res.Error, "过多") {
+		t.Fatalf("应返回限流提示, got %q", res.Error)
+	}
+}
+
 // init 首台设备应拿到 role A。
 func TestWS_Init_BecomesA(t *testing.T) {
 	ts := newTestServer(t)
