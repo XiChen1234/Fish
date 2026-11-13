@@ -252,21 +252,6 @@ func (s *Store) GetDevice(deviceID string) (*Device, error) {
 	return d, nil
 }
 
-// GetDeviceByToken 按 token 查设备（JWT 验证后定位）。
-func (s *Store) GetDeviceByToken(token string) (*Device, error) {
-	d := &Device{}
-	err := s.db.QueryRow(
-		`SELECT device_id, role, token, created_at FROM devices WHERE token=?`, token,
-	).Scan(&d.DeviceID, &d.Role, &d.Token, &d.CreatedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return d, nil
-}
-
 // DeviceCount 返回指定 role 的设备数，role 为空则返回总数。
 func (s *Store) DeviceCount(role string) (int, error) {
 	var c int

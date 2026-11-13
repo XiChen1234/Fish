@@ -76,28 +76,6 @@ func New(h Handler) *Hub {
 // SetHandler 后置注入业务处理器（业务处理器与 Hub 存在互相引用）。
 func (h *Hub) SetHandler(hd Handler) { h.handler = hd }
 
-// sendReady 连接建立后的首帧，见协议 §4.2。
-func (h *Hub) sendReady(c *Conn) {
-	var peer string
-	if h.PeerOf != nil {
-		peer, _ = h.PeerOf(c.Endpoint)
-	}
-	var lastSeq int64
-	if h.LastSeq != nil {
-		lastSeq = h.LastSeq()
-	}
-	d, err := json.Marshal(struct {
-		You        string `json:"you"`
-		Peer       string `json:"peer"`
-		PeerOnline bool   `json:"peer_online"`
-		LastSeq    int64  `json:"last_seq"`
-	}{c.Endpoint, peer, h.Online(peer), lastSeq})
-	if err != nil {
-		return
-	}
-	c.Send(Frame{V: 1, Type: "ready", TS: time.Now().UnixMilli(), Data: d})
-}
-
 func (h *Hub) Register(c *Conn) {
 	h.mu.Lock()
 	if h.conns[c.Endpoint] == nil {

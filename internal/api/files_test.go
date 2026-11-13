@@ -285,7 +285,7 @@ func TestE2E_ImageMessageFlow(t *testing.T) {
 	sendData, _ := json.Marshal(map[string]any{
 		"kind":    "image",
 		"file_id": upRes.FileID,
-		"w": 8, "h": 8, "size": upRes.Size,
+		"w":       8, "h": 8, "size": upRes.Size,
 	})
 	_ = wsA.WriteJSON(hub.Frame{V: 1, Type: "msg.send", ID: "img-1", Data: sendData})
 	// 排空 ack（A）和 msg.new（B）
@@ -332,7 +332,7 @@ func makeJWTLogin(t *testing.T, ts *httptest.Server, deviceID string) string {
 	}
 	defer ws.Close()
 	authData, _ := json.Marshal(map[string]any{
-		"device_id":    deviceID, "password": "secret1234", "action": "login",
+		"device_id": deviceID, "password": "secret1234", "action": "login",
 		"desired_role": "B", // A 角色由 init 设备占位，新登录设备默认 B
 	})
 	_ = ws.WriteJSON(hub.Frame{V: 1, Type: "auth", Data: authData})

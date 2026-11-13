@@ -191,22 +191,6 @@ func (a *Auth) Verify(token string) (role, deviceID string, ok bool) {
 	return claims.Role, claims.DeviceID, true
 }
 
-// VerifyFromBearer 从 Authorization: Bearer <token> 头或 ?token= query 取值验证。
-func (a *Auth) VerifyFromBearer(bearerHeader, queryToken string) (role, deviceID string, ok bool) {
-	tok := ""
-	const prefix = "Bearer "
-	if len(bearerHeader) > len(prefix) && bearerHeader[:len(prefix)] == prefix {
-		tok = bearerHeader[len(prefix):]
-	}
-	if tok == "" {
-		tok = queryToken
-	}
-	if tok == "" {
-		return "", "", false
-	}
-	return a.Verify(strings.TrimSpace(tok))
-}
-
 // ---------- PeerOf ----------
 
 // PeerOf 是给 Hub/Handler 用的：给定 A 返回 B，给定 B 返回 A。
@@ -266,11 +250,4 @@ func validatePassword(p string) error {
 		return fmt.Errorf("密码长度需在 %d-%d 之间", passwordMinLen, passwordMaxLen)
 	}
 	return nil
-}
-
-// RandDeviceID 生成一个短 device_id，供浏览器端首次生成用。
-func RandDeviceID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }
