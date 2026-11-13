@@ -21,8 +21,9 @@ import (
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	cfg := &config.Config{
-		MaxTextBytes: config.DefaultMaxTextBytes,
-		MaxFileBytes: config.DefaultMaxFileBytes,
+		DataDir:       t.TempDir(), // 避免测试产物（files/）落到包目录
+		MaxTextBytes:  config.DefaultMaxTextBytes,
+		MaxFileBytes:  config.DefaultMaxFileBytes,
 	}
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

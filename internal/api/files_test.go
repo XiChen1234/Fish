@@ -16,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"fish/internal/config"
 	"fish/internal/hub"
 )
 
@@ -186,6 +187,25 @@ func TestFileUpload_RejectNonImage(t *testing.T) {
 	code, body := uploadFile(t, ts, tok, "evil.png", []byte("<?php echo 1; ?>"))
 	if code != http.StatusBadRequest {
 		t.Fatalf("非图片应 400，got %d: %s", code, body)
+	}
+}
+
+// TestFileUpload_RejectOversize 超过上限的文件必须整体拒绝，
+// 不能被 LimitReader 静默截断后当作合法图片落盘。
+func TestFileUpload_RejectOversize(t *testing.T) {
+	ts := newTestServer(t)
+	tok := makeJWT(t, ts)
+
+	// 保留真实 PNG 魔数，确保先通过类型嗅探，再在大小校验处被拒
+	payload := make([]byte, int(config.DefaultMaxFileBytes)+1)
+	copy(payload, makePNG(t))
+
+	code, body := uploadFile(t, ts, tok, "big.png", payload)
+	if code != http.StatusBadRequest {
+		t.Fatalf("超限上传应 400，got %d: %s", code, body)
+	}
+	if !strings.Contains(string(body), "大小上限") {
+		t.Fatalf("错误信息应提示大小上限，got: %s", body)
 	}
 }
 

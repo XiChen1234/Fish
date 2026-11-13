@@ -37,6 +37,10 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "multipart 解析失败或文件超限: " + err.Error()})
 		return
 	}
+	// 超出内存阈值的部分会落在系统临时目录，请求结束后必须清理
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
 	file, _, err := r.FormFile("file")
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少 file 字段"})
@@ -54,7 +58,9 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rest, err := io.ReadAll(io.LimitReader(file, s.cfg.MaxFileBytes))
+	// 多读 1 字节以识别超限：LimitReader 恰好读满上限时会静默截断，
+	// 之前的实现因此把 10MB~11MB 的图片截成 10MB 后仍返回 200。
+	rest, err := io.ReadAll(io.LimitReader(file, s.cfg.MaxFileBytes-int64(n)+1))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "读取上传内容失败"})
 		return
