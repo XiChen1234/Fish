@@ -54,18 +54,29 @@ jobs:
           script: |
             set -e
 
+            # ---------- 0. 权限检查：root 或免密 sudo ----------
+            if [ "$(id -u)" -eq 0 ]; then
+              SUDO=""
+            elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+              SUDO="sudo -n"
+            else
+              echo "✗ 部署用户 $(id -un) 不是 root，且没有免密 sudo 权限"
+              echo "  请把 SERVER_USER 改为 root，或为该用户配置 NOPASSWD 的 sudo"
+              exit 1
+            fi
+
             # ---------- 1. 幂等初始化（第一次部署自动完成，后续幂等 no-op） ----------
             if ! id -u fish >/dev/null 2>&1; then
-              useradd --system --no-create-home --shell /usr/sbin/nologin fish
+              $SUDO useradd --system --no-create-home --shell /usr/sbin/nologin fish
               echo "+ 创建 fish 运行用户 (UID=$(id -u fish))"
             fi
-            mkdir -p /opt/fish
-            chown fish:fish /opt/fish
+            $SUDO mkdir -p /opt/fish
+            $SUDO chown fish:fish /opt/fish
 
             # systemd 服务单元（每次覆盖，保证与仓库版本一致）
             # 不依赖 config.json：监听地址由命令行参数给定，数据目录默认 /opt/fish/data。
             # 若服务器上存在 /opt/fish/config.json 仍会被读取（用于调整大小上限等）。
-            cat > /etc/systemd/system/fish.service <<'UNIT'
+            $SUDO tee /etc/systemd/system/fish.service >/dev/null <<'UNIT'
             [Unit]
             Description=Fish private messaging server (single room, dynamic pairing)
             After=network-online.target
@@ -89,7 +100,7 @@ jobs:
             [Install]
             WantedBy=multi-user.target
             UNIT
-            systemctl daemon-reload
+            $SUDO systemctl daemon-reload
             echo "+ systemd 单元就绪"
 
             # ---------- 2. 原子替换 ----------
@@ -97,19 +108,19 @@ jobs:
               echo "✗ 未找到上传的二进制 /tmp/fish-upload/fish-server"
               exit 1
             fi
-            if [ -f /opt/fish/fish-server ]; then
-              cp -a /opt/fish/fish-server /opt/fish/fish-server.bak
+            if $SUDO test -f /opt/fish/fish-server; then
+              $SUDO cp -a /opt/fish/fish-server /opt/fish/fish-server.bak
             fi
-            mv /tmp/fish-upload/fish-server /opt/fish/fish-server.new
+            $SUDO mv /tmp/fish-upload/fish-server /opt/fish/fish-server.new
             # 同分区 rename 才是原子替换；跨分区（/tmp → /opt）先落到 .new 再 rename
-            mv /opt/fish/fish-server.new /opt/fish/fish-server
-            chmod 755 /opt/fish/fish-server
-            chown fish:fish /opt/fish/fish-server
+            $SUDO mv /opt/fish/fish-server.new /opt/fish/fish-server
+            $SUDO chmod 755 /opt/fish/fish-server
+            $SUDO chown fish:fish /opt/fish/fish-server
             echo "+ 二进制已替换（旧版本已备份为 fish-server.bak）"
 
             # ---------- 3. 启用开机自启 + 重启 ----------
-            systemctl enable fish
-            systemctl restart fish
+            $SUDO systemctl enable fish
+            $SUDO systemctl restart fish
             sleep 2
 
             if systemctl is-active fish >/dev/null 2>&1; then
@@ -119,11 +130,11 @@ jobs:
               curl -fsS http://127.0.0.1:19090/healthz || echo "⚠ /healthz 不可达"
             else
               echo "✗ fish 启动失败，自动回滚..."
-              journalctl -u fish --no-pager -n 30 || true
-              if [ -f /opt/fish/fish-server.bak ]; then
-                mv /opt/fish/fish-server.bak /opt/fish/fish-server
-                chmod 755 /opt/fish/fish-server
-                systemctl restart fish || true
+              $SUDO journalctl -u fish --no-pager -n 30 || true
+              if $SUDO test -f /opt/fish/fish-server.bak; then
+                $SUDO mv /opt/fish/fish-server.bak /opt/fish/fish-server
+                $SUDO chmod 755 /opt/fish/fish-server
+                $SUDO systemctl restart fish || true
                 if systemctl is-active fish >/dev/null 2>&1; then
                   echo "✓ 回滚成功，旧二进制已启动"
                 fi
