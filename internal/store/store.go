@@ -59,6 +59,21 @@ CREATE TABLE IF NOT EXISTS messages (
 	ts      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_seq ON messages(seq);
+
+-- 房间表：存储密码 hash，房间只有一个
+CREATE TABLE IF NOT EXISTS rooms (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	password_hash  TEXT    NOT NULL,
+	created_at     INTEGER NOT NULL
+);
+
+-- 设备表：device_id 唯一；role 为 'A' 或 'B'，同一 role 允许多设备
+CREATE TABLE IF NOT EXISTS devices (
+	device_id  TEXT PRIMARY KEY,
+	role       TEXT NOT NULL CHECK(role IN ('A','B')),
+	token      TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
 `
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -142,4 +157,113 @@ func (s *Store) LastSeq() int64 {
 		return 0
 	}
 	return v.Int64
+}
+
+// ---------- Room ----------
+
+// Room 房间基本信息。
+type Room struct {
+	ID           int64
+	PasswordHash string
+	CreatedAt    int64
+}
+
+// GetRoom 返回当前房间（数据库中应只有一条记录），未初始化返回 nil,nil。
+func (s *Store) GetRoom() (*Room, error) {
+	r := &Room{}
+	err := s.db.QueryRow(`SELECT id, password_hash, created_at FROM rooms ORDER BY id LIMIT 1`).Scan(
+		&r.ID, &r.PasswordHash, &r.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// InitRoom 首次初始化房间：写入密码 hash。成功返回 room id。
+// 如果房间已存在，返回 (已存在的 id, nil)。
+func (s *Store) InitRoom(passwordHash string) (int64, error) {
+	existing, err := s.GetRoom()
+	if err != nil {
+		return 0, err
+	}
+	if existing != nil {
+		return existing.ID, nil
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO rooms(password_hash, created_at) VALUES(?,?)`,
+		passwordHash, time.Now().UnixMilli(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// ---------- Device ----------
+
+// Device 设备注册信息。
+type Device struct {
+	DeviceID  string
+	Role      string
+	Token     string
+	CreatedAt int64
+}
+
+// UpsertDevice 注册或更新设备（同一 device_id 覆盖旧记录）。
+// role 必须为 'A' 或 'B'。
+func (s *Store) UpsertDevice(deviceID, role, token string) error {
+	if role != "A" && role != "B" {
+		return fmt.Errorf("非法 role: %s", role)
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO devices(device_id, role, token, created_at) VALUES(?,?,?,?)
+		 ON CONFLICT(device_id) DO UPDATE SET role=excluded.role, token=excluded.token`,
+		deviceID, role, token, time.Now().UnixMilli(),
+	)
+	return err
+}
+
+// GetDevice 按 device_id 查询。
+func (s *Store) GetDevice(deviceID string) (*Device, error) {
+	d := &Device{}
+	err := s.db.QueryRow(
+		`SELECT device_id, role, token, created_at FROM devices WHERE device_id=?`, deviceID,
+	).Scan(&d.DeviceID, &d.Role, &d.Token, &d.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// GetDeviceByToken 按 token 查设备（JWT 验证后定位）。
+func (s *Store) GetDeviceByToken(token string) (*Device, error) {
+	d := &Device{}
+	err := s.db.QueryRow(
+		`SELECT device_id, role, token, created_at FROM devices WHERE token=?`, token,
+	).Scan(&d.DeviceID, &d.Role, &d.Token, &d.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// DeviceCount 返回指定 role 的设备数，role 为空则返回总数。
+func (s *Store) DeviceCount(role string) (int, error) {
+	var c int
+	if role == "" {
+		err := s.db.QueryRow(`SELECT COUNT(*) FROM devices`).Scan(&c)
+		return c, err
+	}
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM devices WHERE role=?`, role).Scan(&c)
+	return c, err
 }

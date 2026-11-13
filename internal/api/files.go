@@ -136,16 +136,21 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 
 // authFile 文件接口鉴权：Bearer 头或 ?token=（img 标签场景）。
 func (s *Server) authFile(w http.ResponseWriter, r *http.Request) (string, bool) {
-	token := bearer(r)
-	if token == "" {
-		token = r.URL.Query().Get("token")
+	const prefix = "Bearer "
+	v := r.Header.Get("Authorization")
+	tok := ""
+	if len(v) > len(prefix) && v[:len(prefix)] == prefix {
+		tok = v[len(prefix):]
 	}
-	id, ok := s.auth.Verify(token)
+	if tok == "" {
+		tok = r.URL.Query().Get("token")
+	}
+	role, _, ok := s.auth.Verify(tok)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid token"})
 		return "", false
 	}
-	return id, true
+	return role, true
 }
 
 func newFileID() (string, error) {

@@ -23,25 +23,31 @@ type Handler interface {
 	Handle(c *Conn, f Frame)
 }
 
-// Conn 一个已鉴权的 WS 连接。
+// Conn 一个已鉴权的 WS 连接。Endpoint 为 "A" 或 "B"；
+// DeviceID 是客户端生成的唯一设备标识（一个设备对应一个 token）。
 type Conn struct {
-	Endpoint string // 身份 a / b
+	Endpoint string // "A" / "B"
+	DeviceID string
 	ws       *websocket.Conn
 	send     chan Frame
 	closeOnce sync.Once
 }
 
-// NewConn 创建一个已鉴权连接（api 层完成 WS 升级与鉴权后调用）。
-func NewConn(endpoint string, ws *websocket.Conn) *Conn {
-	return &Conn{Endpoint: endpoint, ws: ws, send: make(chan Frame, SendBufferCap)}
+// NewConn 创建一个已鉴权连接（api 层完成 WS 升级与 auth 握手后调用）。
+func NewConn(endpoint, deviceID string, ws *websocket.Conn) *Conn {
+	return &Conn{Endpoint: endpoint, DeviceID: deviceID, ws: ws, send: make(chan Frame, SendBufferCap)}
 }
 
 func (c *Conn) Send(f Frame) {
+	defer func() {
+		if r := recover(); r != nil {
+			// channel 已关闭：连接已断开，忽略
+		}
+	}()
 	select {
 	case c.send <- f:
 	default:
-		// 发送队列满视为僵死连接，主动断开
-		log.Printf("[hub] endpoint=%s 发送队列满，断开连接", c.Endpoint)
+		log.Printf("[hub] endpoint=%s device=%s 发送队列满，断开连接", c.Endpoint, c.DeviceID)
 		go c.Close()
 	}
 }
@@ -171,13 +177,13 @@ const (
 	SendBufferCap = 64
 )
 
-// Run 连接主循环：读泵（含超时管理）+ 写泵。
-// 阻塞直至连接结束，返回前保证 Unregister。
+// Run 连接主循环。鉴权（auth 帧）由 API 层在进入 Run 前完成，
+// Run 内只负责 Register → 消息读循环 → Unregister。
+// 首帧 ready 已废弃：所有首帧信息（role、peer_online、last_seq）
+// 由 API 层在 auth 成功后通过 auth.result 一并下发。
 func (h *Hub) Run(c *Conn) {
 	h.Register(c)
 	defer h.Unregister(c)
-
-	h.sendReady(c)
 
 	done := make(chan struct{})
 	go writePump(c, done)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"flag"
 	"log"
 	"net/http"
@@ -28,19 +29,10 @@ func main() {
 		log.Fatalf("加载配置失败: %v", err)
 	}
 	log.Printf("配置加载成功: listen=%s data_dir=%s", cfg.Listen, cfg.DataDir)
-	for _, ep := range cfg.Endpoints {
-		log.Printf("固定身份: id=%s token=%s", ep.ID, ep.Token)
-	}
 
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		log.Fatalf("创建数据目录失败: %v", err)
 	}
-
-	tokens := make(map[string]string, len(cfg.Endpoints))
-	for _, ep := range cfg.Endpoints {
-		tokens[ep.ID] = ep.Token
-	}
-	a := auth.New(tokens)
 
 	st, err := store.Open(filepath.Join(cfg.DataDir, "fish.db"))
 	if err != nil {
@@ -49,8 +41,12 @@ func main() {
 	defer st.Close()
 	log.Printf("存储就绪: 当前最大 seq=%d", st.LastSeq())
 
-	h := hub.New(nil) // handler 在下方接线（hub 引用需先创建）
-	handler := msg.New(st, h, a, cfg)
+	jwtKey := loadOrGenJWTKey(filepath.Join(cfg.DataDir, "jwt.key"))
+	a := auth.New(st, jwtKey)
+	log.Printf("鉴权就绪（动态配对模式，JWT key 持久化）")
+
+	h := hub.New(nil) // handler 在下方接线
+	handler := msg.New(st, h, cfg)
 	h.SetHandler(handler)
 	h.LastSeq = func() int64 { return st.LastSeq() }
 
@@ -76,4 +72,21 @@ func main() {
 	log.Println("收到退出信号，正在关闭...")
 	_ = httpSrv.Shutdown(context.Background())
 	log.Println("已退出")
+}
+
+// loadOrGenJWTKey 从 path 读取 HMAC 密钥，不存在则生成并写入（32 字节）。
+// 持久化后服务重启 JWT 仍有效。
+func loadOrGenJWTKey(path string) []byte {
+	if data, err := os.ReadFile(path); err == nil && len(data) >= 16 {
+		return data
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		log.Fatalf("生成 JWT key 失败: %v", err)
+	}
+	if err := os.WriteFile(path, key, 0o600); err != nil {
+		log.Fatalf("写入 JWT key 失败: %v", err)
+	}
+	log.Printf("已生成并保存 JWT key 到 %s", path)
+	return key
 }

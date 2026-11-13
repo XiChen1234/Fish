@@ -27,12 +27,11 @@ const (
 type Handler struct {
 	store *store.Store
 	hub   *hub.Hub
-	auth  *auth.Auth
 	cfg   *config.Config
 }
 
-func New(st *store.Store, h *hub.Hub, a *auth.Auth, cfg *config.Config) *Handler {
-	return &Handler{store: st, hub: h, auth: a, cfg: cfg}
+func New(st *store.Store, h *hub.Hub, cfg *config.Config) *Handler {
+	return &Handler{store: st, hub: h, cfg: cfg}
 }
 
 func (h *Handler) Handle(c *hub.Conn, f hub.Frame) {
@@ -110,7 +109,7 @@ func (h *Handler) onSend(c *hub.Conn, f hub.Frame) {
 		Data: mustJSON(map[string]any{"ref": f.ID, "seq": m.Seq, "ts": m.TS})})
 
 	// 投递对端（在线实时；离线由 sync 补投）
-	peer, ok := h.auth.Peer(c.Endpoint)
+	peer, ok := auth.PeerOf(c.Endpoint)
 	if ok {
 		h.hub.SendTo(peer, hub.Frame{V: 1, Type: "msg.new", TS: time.Now().UnixMilli(),
 			Data: mustJSON(m)})

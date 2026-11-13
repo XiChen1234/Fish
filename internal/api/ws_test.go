@@ -21,21 +21,17 @@ import (
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	cfg := &config.Config{
-		Endpoints: []config.Endpoint{
-			{ID: "a", Token: "tok-a"},
-			{ID: "b", Token: "tok-b"},
-		},
 		MaxTextBytes: config.DefaultMaxTextBytes,
 		MaxFileBytes: config.DefaultMaxFileBytes,
 	}
-	a := auth.New(map[string]string{"a": "tok-a", "b": "tok-b"})
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("打开存储失败: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
+	a := auth.New(st, []byte("test-key-32bytes!!abcdefghij"))
 	h := hub.New(nil)
-	h.SetHandler(msg.New(st, h, a, cfg))
+	h.SetHandler(msg.New(st, h, cfg))
 	h.LastSeq = func() int64 { return st.LastSeq() }
 	s := New(cfg, a, h, st)
 	ts := httptest.NewServer(s.Routes())
@@ -43,12 +39,8 @@ func newTestServer(t *testing.T) *httptest.Server {
 	return ts
 }
 
-func wsURL(ts *httptest.Server, query string) string {
-	u := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
-	if query != "" {
-		u += "?" + query
-	}
-	return u
+func wsURL(ts *httptest.Server) string {
+	return "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
 }
 
 func readFrame(t *testing.T, ws *websocket.Conn) hub.Frame {
@@ -62,89 +54,151 @@ func readFrame(t *testing.T, ws *websocket.Conn) hub.Frame {
 	return f
 }
 
-// 正确 token（header 方式）应完成握手并收到 ready 帧。
-func TestWS_AuthHeader_OK(t *testing.T) {
-	ts := newTestServer(t)
-
-	hdr := http.Header{"Authorization": []string{"Bearer tok-a"}}
-	ws, resp, err := websocket.DefaultDialer.Dial(wsURL(ts, ""), hdr)
+// dialWS 握手并发送 auth 帧，返回已就绪 WS 连接。
+// 调用方负责 close。
+func dialWS(t *testing.T, ts *httptest.Server, deviceID, password, action, desiredRole string) *websocket.Conn {
+	t.Helper()
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL(ts), nil)
 	if err != nil {
-		t.Fatalf("握手失败: %v (http=%d)", err, resp.StatusCode)
+		t.Fatal(err)
+	}
+	authData, _ := json.Marshal(map[string]any{
+		"device_id":    deviceID,
+		"password":     password,
+		"action":       action,
+		"desired_role": desiredRole,
+	})
+	_ = ws.WriteJSON(hub.Frame{V: 1, Type: "auth", Data: authData})
+	f := readFrame(t, ws)
+	if f.Type != "auth.result" {
+		t.Fatalf("期望 auth.result, got %s", f.Type)
+	}
+	var res struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+		Role    string `json:"role"`
+	}
+	_ = json.Unmarshal(f.Data, &res)
+	if !res.Success {
+		t.Fatalf("auth 失败: %s", res.Error)
+	}
+	return ws
+}
+
+// init 首台设备应拿到 role A。
+func TestWS_Init_BecomesA(t *testing.T) {
+	ts := newTestServer(t)
+	ws := dialWS(t, ts, "dev-1", "secret1234", "init", "")
+	defer ws.Close()
+	// 房间已占，再次 init 应失败
+	ws2, _, _ := websocket.DefaultDialer.Dial(wsURL(ts), nil)
+	authData, _ := json.Marshal(map[string]any{
+		"device_id": "dev-2", "password": "secret1234", "action": "init",
+	})
+	_ = ws2.WriteJSON(hub.Frame{V: 1, Type: "auth", Data: authData})
+	f := readFrame(t, ws2)
+	var res struct {
+		Success bool `json:"success"`
+	}
+	_ = json.Unmarshal(f.Data, &res)
+	if res.Success {
+		t.Fatal("重复 init 应失败")
+	}
+	ws2.Close()
+}
+
+// login 第二台设备应拿到 role B。
+func TestWS_Login_SecondIsB(t *testing.T) {
+	ts := newTestServer(t)
+	wsA := dialWS(t, ts, "dev-A", "secret1234", "init", "")
+	defer wsA.Close()
+	wsB := dialWS(t, ts, "dev-B", "secret1234", "login", "")
+	defer wsB.Close()
+
+	// B Register 时 broadcastPresence → A 收到 presence 帧
+	// 过滤掉，只等 msg.new
+	drainUntil(t, wsA, "presence")
+
+	// B 发给 A，A 应收到
+	sendData, _ := json.Marshal(map[string]any{"kind": "text", "body": "hi-A"})
+	_ = wsB.WriteJSON(hub.Frame{V: 1, Type: "msg.send", ID: "x", Data: sendData})
+
+	// B 自己会回 msg.ack；再等 B Register 的 presence 被 A 收到后，A 应收到 msg.new
+	var gotMsg bool
+	for i := 0; i < 5; i++ {
+		f := readFrame(t, wsA)
+		if f.Type == "msg.new" {
+			gotMsg = true
+			break
+		}
+	}
+	if !gotMsg {
+		t.Fatal("A 应收到 msg.new")
+	}
+}
+
+// drainUntil 读掉 ws 上直到遇到 skip 帧类型之前的所有帧。
+func drainUntil(t *testing.T, ws *websocket.Conn, skip string) {
+	t.Helper()
+	_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		var f hub.Frame
+		if err := ws.ReadJSON(&f); err != nil {
+			return
+		}
+		if f.Type == skip {
+			return
+		}
+	}
+}
+
+// 错误密码应失败。
+func TestWS_BadPassword(t *testing.T) {
+	ts := newTestServer(t)
+	_ = dialWS(t, ts, "dev-1", "secret1234", "init", "")
+
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL(ts), nil)
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer ws.Close()
-
+	authData, _ := json.Marshal(map[string]any{
+		"device_id": "dev-2", "password": "wrongpw", "action": "login",
+	})
+	_ = ws.WriteJSON(hub.Frame{V: 1, Type: "auth", Data: authData})
 	f := readFrame(t, ws)
-	if f.Type != "ready" {
-		t.Fatalf("首帧应为 ready，got %s", f.Type)
+	var res struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
 	}
-	var d struct {
-		You  string `json:"you"`
-		Peer string `json:"peer"`
-	}
-	if err := json.Unmarshal(f.Data, &d); err != nil {
-		t.Fatalf("ready.data 解析失败: %v", err)
-	}
-	if d.You != "a" || d.Peer != "b" {
-		t.Fatalf("ready 身份错误: you=%s peer=%s", d.You, d.Peer)
+	_ = json.Unmarshal(f.Data, &res)
+	if res.Success {
+		t.Fatal("坏密码应失败")
 	}
 }
 
-// 正确 token（query 方式，供浏览器 WS 使用）应完成握手。
-func TestWS_AuthQuery_OK(t *testing.T) {
+// 首帧非 auth 应失败。
+func TestWS_FirstFrameNotAuth(t *testing.T) {
 	ts := newTestServer(t)
-
-	ws, _, err := websocket.DefaultDialer.Dial(wsURL(ts, "token=tok-b"), nil)
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL(ts), nil)
 	if err != nil {
-		t.Fatalf("握手失败: %v", err)
+		t.Fatal(err)
 	}
 	defer ws.Close()
-
+	_ = ws.WriteJSON(hub.Frame{V: 1, Type: "ping"})
 	f := readFrame(t, ws)
-	if f.Type != "ready" {
-		t.Fatalf("首帧应为 ready，got %s", f.Type)
+	var res struct {
+		Success bool `json:"success"`
 	}
-	var d struct {
-		You  string `json:"you"`
-		Peer string `json:"peer"`
-	}
-	_ = json.Unmarshal(f.Data, &d)
-	if d.You != "b" || d.Peer != "a" {
-		t.Fatalf("ready 身份错误: you=%s peer=%s", d.You, d.Peer)
-	}
-}
-
-// 错误 token 应被拒绝（401，握手不升级）。
-func TestWS_BadToken_Rejected(t *testing.T) {
-	ts := newTestServer(t)
-
-	ws, resp, err := websocket.DefaultDialer.Dial(wsURL(ts, "token=wrong"), nil)
-	if err == nil {
-		ws.Close()
-		t.Fatal("错误 token 不应握手成功")
-	}
-	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("应返回 401，got %v", resp)
-	}
-}
-
-// 未带 token 应被拒绝。
-func TestWS_NoToken_Rejected(t *testing.T) {
-	ts := newTestServer(t)
-
-	ws, resp, err := websocket.DefaultDialer.Dial(wsURL(ts, ""), nil)
-	if err == nil {
-		ws.Close()
-		t.Fatal("未带 token 不应握手成功")
-	}
-	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("应返回 401，got %v", resp)
+	_ = json.Unmarshal(f.Data, &res)
+	if res.Success {
+		t.Fatal("首帧非 auth 应失败")
 	}
 }
 
 // 健康检查端点。
 func TestHealthz(t *testing.T) {
 	ts := newTestServer(t)
-
 	resp, err := http.Get(ts.URL + "/healthz")
 	if err != nil {
 		t.Fatal(err)
@@ -158,17 +212,8 @@ func TestHealthz(t *testing.T) {
 // ping → pong 心跳往返。
 func TestWS_PingPong(t *testing.T) {
 	ts := newTestServer(t)
-
-	ws, _, err := websocket.DefaultDialer.Dial(wsURL(ts, "token=tok-a"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ws := dialWS(t, ts, "dev-1", "secret1234", "init", "")
 	defer ws.Close()
-
-	// 先读 ready
-	if f := readFrame(t, ws); f.Type != "ready" {
-		t.Fatalf("首帧应为 ready，got %s", f.Type)
-	}
 
 	if err := ws.WriteJSON(hub.Frame{V: 1, Type: "ping"}); err != nil {
 		t.Fatal(err)
