@@ -26,10 +26,10 @@ type Handler interface {
 // Conn 一个已鉴权的 WS 连接。Endpoint 为 "A" 或 "B"；
 // DeviceID 是客户端生成的唯一设备标识（一个设备对应一个 token）。
 type Conn struct {
-	Endpoint string // "A" / "B"
-	DeviceID string
-	ws       *websocket.Conn
-	send     chan Frame
+	Endpoint  string // "A" / "B"
+	DeviceID  string
+	ws        *websocket.Conn
+	send      chan Frame
 	closeOnce sync.Once
 }
 
@@ -65,8 +65,8 @@ type Hub struct {
 	handler Handler
 
 	// PeerOf 身份->对端解析；LastSeq 当前最大消息 seq（阶段2接入存储后注入）。
-	PeerOf   func(id string) (string, bool)
-	LastSeq  func() int64
+	PeerOf  func(id string) (string, bool)
+	LastSeq func() int64
 }
 
 func New(h Handler) *Hub {
@@ -160,9 +160,18 @@ func (h *Hub) Online(endpoint string) bool {
 
 // SendTo 向某身份的全部在线连接非阻塞投递帧。
 func (h *Hub) SendTo(endpoint string, f Frame) {
+	h.SendToExcept(endpoint, nil, f)
+}
+
+// SendToExcept 向某身份的全部在线连接投递帧，但跳过 except（通常为发送方自身连接）。
+// 用于同角色多设备场景：本角色其他设备需要收到自己发出的消息。
+func (h *Hub) SendToExcept(endpoint string, except *Conn, f Frame) {
 	h.mu.RLock()
 	conns := make([]*Conn, 0, len(h.conns[endpoint]))
 	for c := range h.conns[endpoint] {
+		if c == except {
+			continue
+		}
 		conns = append(conns, c)
 	}
 	h.mu.RUnlock()

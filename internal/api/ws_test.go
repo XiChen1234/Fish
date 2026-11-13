@@ -21,9 +21,9 @@ import (
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	cfg := &config.Config{
-		DataDir:       t.TempDir(), // 避免测试产物（files/）落到包目录
-		MaxTextBytes:  config.DefaultMaxTextBytes,
-		MaxFileBytes:  config.DefaultMaxFileBytes,
+		DataDir:      t.TempDir(), // 避免测试产物（files/）落到包目录
+		MaxTextBytes: config.DefaultMaxTextBytes,
+		MaxFileBytes: config.DefaultMaxFileBytes,
 	}
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -136,6 +136,37 @@ func TestWS_Login_SecondIsB(t *testing.T) {
 	if !gotMsg {
 		t.Fatal("A 应收到 msg.new")
 	}
+}
+
+// 同角色多设备：A1 发送后，同角色的 A2 也应收到 msg.new。
+func TestWS_SameRoleEcho(t *testing.T) {
+	ts := newTestServer(t)
+	wsA1 := dialWS(t, ts, "dev-a1", "secret1234", "init", "")
+	defer wsA1.Close()
+	wsB := dialWS(t, ts, "dev-b", "secret1234", "login", "")
+	defer wsB.Close()
+	wsA2 := dialWS(t, ts, "dev-a2", "secret1234", "login", "A")
+	defer wsA2.Close()
+
+	sendData, _ := json.Marshal(map[string]any{"kind": "text", "body": "from-a1"})
+	_ = wsA1.WriteJSON(hub.Frame{V: 1, Type: "msg.send", ID: "r1", Data: sendData})
+
+	for i := 0; i < 5; i++ {
+		f := readFrame(t, wsA2)
+		if f.Type != "msg.new" {
+			continue
+		}
+		var m struct {
+			From string `json:"from"`
+			Body string `json:"body"`
+		}
+		_ = json.Unmarshal(f.Data, &m)
+		if m.From != "A" || m.Body != "from-a1" {
+			t.Fatalf("回显内容不符: %+v", m)
+		}
+		return
+	}
+	t.Fatal("同角色设备 A2 未收到 msg.new")
 }
 
 // drainUntil 读掉 ws 上直到遇到 skip 帧类型之前的所有帧。

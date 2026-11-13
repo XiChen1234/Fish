@@ -109,11 +109,12 @@ func (h *Handler) onSend(c *hub.Conn, f hub.Frame) {
 		Data: mustJSON(map[string]any{"ref": f.ID, "seq": m.Seq, "ts": m.TS})})
 
 	// 投递对端（在线实时；离线由 sync 补投）
-	peer, ok := auth.PeerOf(c.Endpoint)
-	if ok {
-		h.hub.SendTo(peer, hub.Frame{V: 1, Type: "msg.new", TS: time.Now().UnixMilli(),
-			Data: mustJSON(m)})
+	newFrame := hub.Frame{V: 1, Type: "msg.new", TS: time.Now().UnixMilli(), Data: mustJSON(m)}
+	if peer, ok := auth.PeerOf(c.Endpoint); ok {
+		h.hub.SendTo(peer, newFrame)
 	}
+	// 同角色其他设备回显：多端登录时本角色其余设备也应看到这条消息
+	h.hub.SendToExcept(c.Endpoint, c, newFrame)
 }
 
 // ---- msg.ack ----
