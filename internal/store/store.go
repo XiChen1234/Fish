@@ -183,24 +183,34 @@ func (s *Store) GetRoom() (*Room, error) {
 	return r, nil
 }
 
-// InitRoom 首次初始化房间：写入密码 hash。成功返回 room id。
-// 如果房间已存在，返回 (已存在的 id, nil)。
-func (s *Store) InitRoom(passwordHash string) (int64, error) {
-	existing, err := s.GetRoom()
-	if err != nil {
-		return 0, err
-	}
-	if existing != nil {
-		return existing.ID, nil
-	}
+// InitRoom 首次初始化房间：写入密码 hash。成功返回 room id 与是否新建。
+// 使用 INSERT ... WHERE NOT EXISTS 原子插入，并发 init 时只有一个能成功，
+// 其余调用返回 (已存在的 id, false, nil)。
+func (s *Store) InitRoom(passwordHash string) (int64, bool, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO rooms(password_hash, created_at) VALUES(?,?)`,
+		`INSERT INTO rooms(password_hash, created_at)
+		 SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM rooms)`,
 		passwordHash, time.Now().UnixMilli(),
 	)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	return res.LastInsertId()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, false, err
+	}
+	if n > 0 {
+		id, err := res.LastInsertId()
+		return id, true, err
+	}
+	existing, err := s.GetRoom()
+	if err != nil {
+		return 0, false, err
+	}
+	if existing == nil {
+		return 0, false, fmt.Errorf("房间初始化失败")
+	}
+	return existing.ID, false, nil
 }
 
 // ---------- Device ----------

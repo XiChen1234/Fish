@@ -68,8 +68,13 @@ func (a *Auth) Init(deviceID, password string) (role, token string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	if _, err := a.store.InitRoom(string(hash)); err != nil {
+	// 原子初始化：并发 init 只有一个能创建成功，其余返回 ErrRoomExists
+	_, created, err := a.store.InitRoom(string(hash))
+	if err != nil {
 		return "", "", err
+	}
+	if !created {
+		return "", "", ErrRoomExists
 	}
 	return a.registerDevice(deviceID, "A")
 }

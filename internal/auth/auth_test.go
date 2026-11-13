@@ -1,7 +1,9 @@
 package auth_test
 
 import (
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"fish/internal/auth"
@@ -53,6 +55,40 @@ func TestInit_ValidatesInput(t *testing.T) {
 	}
 	if _, _, err := a.Init("d", ""); err == nil {
 		t.Fatal("空密码应报错")
+	}
+}
+
+// TestInit_ConcurrentOnlyOneSucceeds 并发 init 只能有一个成功，避免出现两台 A。
+func TestInit_ConcurrentOnlyOneSucceeds(t *testing.T) {
+	a, st := newAuth(t)
+	const n = 8
+	var wg sync.WaitGroup
+	results := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			_, _, err := a.Init(fmt.Sprintf("dev-%d", i), "secret123")
+			results[i] = err
+		}(i)
+	}
+	wg.Wait()
+
+	success := 0
+	for i, err := range results {
+		switch err {
+		case nil:
+			success++
+		case auth.ErrRoomExists:
+		default:
+			t.Fatalf("dev-%d 返回意外错误: %v", i, err)
+		}
+	}
+	if success != 1 {
+		t.Fatalf("并发 init 应只有 1 个成功，got %d", success)
+	}
+	if cnt, _ := st.DeviceCount("A"); cnt != 1 {
+		t.Fatalf("应只有 1 台 A 设备，got %d", cnt)
 	}
 }
 
@@ -144,6 +180,38 @@ func TestVerify_BadToken(t *testing.T) {
 	a, _ := newAuth(t)
 	if _, _, ok := a.Verify("not-a-token"); ok {
 		t.Fatal("坏 token 应返回 ok=false")
+	}
+}
+
+// TestResume_Validation 覆盖 resume 的设备/token 一致性校验。
+func TestResume_Validation(t *testing.T) {
+	a, _ := newAuth(t)
+	_, tok, _ := a.Init("device-a", "secret123")
+
+	role, did, gotTok, err := a.Resume("", tok)
+	if err != nil || role != "A" || did != "device-a" || gotTok != tok {
+		t.Fatalf("合法 resume 失败: role=%s did=%s err=%v", role, did, err)
+	}
+	if _, _, _, err := a.Resume("device-x", tok); err != auth.ErrDeviceMismatch {
+		t.Fatalf("device_id 不匹配应报 ErrDeviceMismatch, got %v", err)
+	}
+	if _, _, _, err := a.Resume("device-a", "bad-token"); err != auth.ErrInvalidToken {
+		t.Fatalf("坏 token 应报 ErrInvalidToken, got %v", err)
+	}
+
+	// 同设备重新登录换发 token 后，旧 token 立即失效
+	_, tok2, err := a.Login("device-a", "secret123", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok2 == tok {
+		t.Fatal("重新登录应换发不同的 token")
+	}
+	if _, _, _, err := a.Resume("device-a", tok); err != auth.ErrInvalidToken {
+		t.Fatalf("旧 token 应失效, got %v", err)
+	}
+	if _, _, _, err := a.Resume("device-a", tok2); err != nil {
+		t.Fatalf("新 token 应可用: %v", err)
 	}
 }
 
