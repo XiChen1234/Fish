@@ -275,21 +275,30 @@ function connect(action) {
   state.pending.clear();
 
   const wsURL = apiBase().replace(/^http/, 'ws') + '/ws';
-  try { state.ws = new WebSocket(wsURL); }
+  let sock;
+  try { sock = new WebSocket(wsURL); }
   catch (e) { showErr('地址格式错误，应为 http://IP:端口'); return; }
+  state.ws = sock;
 
   let authSent = false;
-  state.ws.onopen = () => {
+  sock.onopen = () => {
+    if (state.ws !== sock) return; // 已被更新的连接取代
     setStatus(true, '已连接，鉴权中…');
     const authData = { device_id: did, action };
     if (action !== 'resume') authData.password = password;
     if (action === 'login' && desiredRole) authData.desired_role = desiredRole;
     if (action === 'resume') authData.token = token;
     authSent = true;
-    state.ws.send(JSON.stringify({ v: 1, type: 'auth', ts: Date.now(), data: authData }));
+    sock.send(JSON.stringify({ v: 1, type: 'auth', ts: Date.now(), data: authData }));
   };
-  state.ws.onmessage = ev => { try { handleFrame(JSON.parse(ev.data)); } catch(e) {} };
-  state.ws.onclose = () => {
+  sock.onmessage = ev => {
+    if (state.ws !== sock) return;
+    try { handleFrame(JSON.parse(ev.data)); } catch(e) {}
+  };
+  sock.onclose = () => {
+    // 旧连接的异步 onclose 不能影响新连接（否则会把用户踢回设置页）
+    if (state.ws !== sock) return;
+    state.ws = null;
     setStatus(false, '连接断开');
     state.syncing = false;
     if (authSent && state.role) {
@@ -300,7 +309,9 @@ function connect(action) {
       showErr('连接失败：服务器不可达');
     }
   };
-  state.ws.onerror = () => setStatus(false, '连接错误');
+  sock.onerror = () => {
+    if (state.ws === sock) setStatus(false, '连接错误');
+  };
 }
 
 function genDeviceID() {
@@ -402,6 +413,8 @@ function handleFrame(f) {
         state.pending.get(d.ref).remove();
         state.pending.delete(d.ref);
       }
+      // sync 请求没有 id 无法按 ref 关联，收到错误时解除锁，允许下次重试
+      state.syncing = false;
       console.error('服务端错误', d);
       showErr('服务端错误 ' + d.code + ': ' + d.message);
       break;
